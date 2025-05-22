@@ -32,7 +32,8 @@ class SCHISMToPlasticParcels:
     Complete workflow class for SCHISM to PlasticParcels integration.
     """
 
-    def __init__(self, schism_file, output_dir='schism_nemo_output', target_resolution=0.01):
+    def __init__(self, schism_file, output_dir='schism_nemo_output', target_resolution=0.01,
+                 lon_bounds=None, lat_bounds=None):
         """
         Initialize the converter.
 
@@ -44,28 +45,71 @@ class SCHISMToPlasticParcels:
             Directory for NEMO-format output files
         target_resolution : float
             Target grid resolution in degrees
+        lon_bounds : tuple or None
+            (lon_min, lon_max) to subset domain, None for full domain
+        lat_bounds : tuple or None
+            (lat_min, lat_max) to subset domain, None for full domain
         """
         self.schism_file = schism_file
         self.output_dir = output_dir
         self.target_resolution = target_resolution
+        self.lon_bounds = lon_bounds
+        self.lat_bounds = lat_bounds
 
         # Create output directory
         os.makedirs(output_dir, exist_ok=True)
 
     def load_schism_data(self):
-        """Load and analyze SCHISM data."""
+        """Load and analyze SCHISM data with optional spatial subsetting."""
         print("1. Loading SCHISM data...")
 
         self.ds = xr.open_dataset(self.schism_file)
 
         # Extract coordinates
-        self.lons = self.ds['SCHISM_hgrid_node_x'].values
-        self.lats = self.ds['SCHISM_hgrid_node_y'].values
-        self.depths = self.ds['depth'].values
+        all_lons = self.ds['SCHISM_hgrid_node_x'].values
+        all_lats = self.ds['SCHISM_hgrid_node_y'].values
+        all_depths = self.ds['depth'].values
 
-        print(f"   ✓ Loaded {len(self.lons)} nodes")
-        print(f"   ✓ Longitude range: {self.lons.min():.3f} to {self.lons.max():.3f}°")
-        print(f"   ✓ Latitude range: {self.lats.min():.3f} to {self.lats.max():.3f}°")
+        print(f"   ✓ Full domain: {len(all_lons)} nodes")
+        print(f"   ✓ Full longitude range: {all_lons.min():.3f} to {all_lons.max():.3f}°")
+        print(f"   ✓ Full latitude range: {all_lats.min():.3f} to {all_lats.max():.3f}°")
+
+        # Apply spatial subsetting if bounds specified
+        if self.lon_bounds is not None or self.lat_bounds is not None:
+            print("   • Applying spatial subsetting...")
+
+            # Default bounds if not specified
+            lon_min = self.lon_bounds[0] if self.lon_bounds else all_lons.min()
+            lon_max = self.lon_bounds[1] if self.lon_bounds else all_lons.max()
+            lat_min = self.lat_bounds[0] if self.lat_bounds else all_lats.min()
+            lat_max = self.lat_bounds[1] if self.lat_bounds else all_lats.max()
+
+            # Create spatial mask
+            spatial_mask = ((all_lons >= lon_min) & (all_lons <= lon_max) &
+                           (all_lats >= lat_min) & (all_lats <= lat_max))
+
+            # Apply mask
+            self.lons = all_lons[spatial_mask]
+            self.lats = all_lats[spatial_mask]
+            self.depths = all_depths[spatial_mask]
+            self.spatial_mask = spatial_mask
+
+            print(f"   ✓ Subset domain: {len(self.lons)} nodes ({len(self.lons)/len(all_lons)*100:.1f}% of full domain)")
+            print(f"   ✓ Subset bounds: {lon_min:.3f} to {lon_max:.3f}°E, {lat_min:.3f} to {lat_max:.3f}°N")
+
+            if len(self.lons) == 0:
+                raise ValueError(f"No SCHISM nodes found in specified bounds: "
+                               f"lon=[{lon_min}, {lon_max}], lat=[{lat_min}, {lat_max}]")
+        else:
+            # Use full domain
+            self.lons = all_lons
+            self.lats = all_lats
+            self.depths = all_depths
+            self.spatial_mask = None
+            print("   ✓ Using full domain (no spatial subsetting)")
+
+        print(f"   ✓ Final longitude range: {self.lons.min():.3f} to {self.lons.max():.3f}°")
+        print(f"   ✓ Final latitude range: {self.lats.min():.3f} to {self.lats.max():.3f}°")
         print(f"   ✓ Depth range: {self.depths.min():.1f} to {self.depths.max():.1f} m")
 
     def create_target_grid(self):
@@ -85,14 +129,27 @@ class SCHISMToPlasticParcels:
         print(f"   ✓ Resolution: {self.target_resolution}° ({self.target_resolution * 111.32:.1f} km)")
 
     def regrid_variables(self):
-        """Regrid SCHISM variables to regular grid."""
+        """Regrid SCHISM variables to regular grid with spatial subsetting support."""
         print("3. Regridding variables...")
 
         self.regridded_data = {}
 
+        # Extract data with spatial subsetting if applied
+        if self.spatial_mask is not None:
+            # Apply spatial mask to data variables
+            u_data = self.ds['depthAverageVelX'][0, :].values[self.spatial_mask]
+            v_data = self.ds['depthAverageVelY'][0, :].values[self.spatial_mask]
+            elev_data = self.ds['elevation'][0, :].values[self.spatial_mask]
+            print(f"   • Using {len(u_data)} nodes from spatial subset")
+        else:
+            # Use full domain data
+            u_data = self.ds['depthAverageVelX'][0, :].values
+            v_data = self.ds['depthAverageVelY'][0, :].values
+            elev_data = self.ds['elevation'][0, :].values
+            print(f"   • Using all {len(u_data)} nodes from full domain")
+
         # Velocity components
         print("   • Regridding U velocity (depthAverageVelX)...")
-        u_data = self.ds['depthAverageVelX'][0, :].values
         u_regridded = griddata(
             points=np.column_stack([self.lons, self.lats]),
             values=u_data,
@@ -103,7 +160,6 @@ class SCHISMToPlasticParcels:
         self.regridded_data['U'] = u_regridded
 
         print("   • Regridding V velocity (depthAverageVelY)...")
-        v_data = self.ds['depthAverageVelY'][0, :].values
         v_regridded = griddata(
             points=np.column_stack([self.lons, self.lats]),
             values=v_data,
@@ -119,7 +175,6 @@ class SCHISMToPlasticParcels:
 
         # Surface elevation as temperature proxy
         print("   • Regridding elevation...")
-        elev_data = self.ds['elevation'][0, :].values
         elev_regridded = griddata(
             points=np.column_stack([self.lons, self.lats]),
             values=elev_data,
@@ -141,6 +196,11 @@ class SCHISMToPlasticParcels:
         self.regridded_data['bathymetry'] = bathy_regridded
 
         print("   ✓ All variables regridded successfully")
+
+        # Print regridding statistics
+        speed_field = np.sqrt(self.regridded_data['U']**2 + self.regridded_data['V']**2)
+        print(f"   ✓ Current speed range: {speed_field.min():.3f} to {speed_field.max():.3f} m/s")
+        print(f"   ✓ Elevation range: {self.regridded_data['elevation'].min():.3f} to {self.regridded_data['elevation'].max():.3f} m")
 
     def save_nemo_format(self):
         """Save regridded data in NEMO format."""
@@ -245,8 +305,8 @@ class SCHISMToPlasticParcels:
             json.dump(settings, f, indent=2)
         print(f"   ✓ Saved {self.settings_file}")
 
-    def run_simulation(self, simulation_hours=6, num_particles=16):
-        """Run PlasticParcels simulation."""
+    def run_simulation(self, simulation_hours=6, num_particles=16, release_locations=None):
+        """Run PlasticParcels simulation with configurable release locations."""
         print("6. Running PlasticParcels simulation...")
 
         # Load regridded data
@@ -269,16 +329,47 @@ class SCHISMToPlasticParcels:
         )
 
         # Create release locations
-        n_side = int(np.sqrt(num_particles))
-        release_lons = np.linspace(self.lons.min() + 0.1, self.lons.max() - 0.1, n_side)
-        release_lats = np.linspace(self.lats.min() + 0.1, self.lats.max() - 0.1, n_side)
+        if release_locations is not None:
+            # Use provided release locations
+            if isinstance(release_locations, dict):
+                # Format: {'lons': [lon1, lon2, ...], 'lats': [lat1, lat2, ...]}
+                release_grid_lons = release_locations['lons']
+                release_grid_lats = release_locations['lats']
+            elif isinstance(release_locations, list):
+                # Format: [(lon1, lat1), (lon2, lat2), ...]
+                release_grid_lons = [loc[0] for loc in release_locations]
+                release_grid_lats = [loc[1] for loc in release_locations]
+            else:
+                raise ValueError("release_locations must be dict with 'lons'/'lats' keys or list of (lon,lat) tuples")
 
-        release_grid_lons = []
-        release_grid_lats = []
-        for lon in release_lons:
-            for lat in release_lats:
-                release_grid_lons.append(lon)
-                release_grid_lats.append(lat)
+            print(f"   ✓ Using {len(release_grid_lons)} custom release locations")
+
+            # Validate release locations are within domain
+            domain_lon_min, domain_lon_max = self.lons.min(), self.lons.max()
+            domain_lat_min, domain_lat_max = self.lats.min(), self.lats.max()
+
+            for i, (lon, lat) in enumerate(zip(release_grid_lons, release_grid_lats)):
+                if not (domain_lon_min <= lon <= domain_lon_max and domain_lat_min <= lat <= domain_lat_max):
+                    print(f"   ⚠️  Warning: Release location {i+1} ({lon:.3f}, {lat:.3f}) is outside domain bounds")
+                    print(f"      Domain: [{domain_lon_min:.3f}, {domain_lon_max:.3f}]°E, [{domain_lat_min:.3f}, {domain_lat_max:.3f}]°N")
+        else:
+            # Create default grid of release locations
+            n_side = int(np.sqrt(num_particles))
+            release_lons = np.linspace(self.lons.min() + 0.1, self.lons.max() - 0.1, n_side)
+            release_lats = np.linspace(self.lats.min() + 0.1, self.lats.max() - 0.1, n_side)
+
+            release_grid_lons = []
+            release_grid_lats = []
+            for lon in release_lons:
+                for lat in release_lats:
+                    release_grid_lons.append(lon)
+                    release_grid_lats.append(lat)
+
+            print(f"   ✓ Created {len(release_grid_lons)} default release locations in {n_side}×{n_side} grid")
+
+        # Print release location summary
+        print(f"   ✓ Release longitude range: {min(release_grid_lons):.3f} to {max(release_grid_lons):.3f}°")
+        print(f"   ✓ Release latitude range: {min(release_grid_lats):.3f} to {max(release_grid_lats):.3f}°")
 
         # Create particles
         pset = parcels.ParticleSet.from_list(
@@ -513,10 +604,25 @@ SOURCE: SCHISM regridded to NEMO
 
         return plot_file
 
-    def run_complete_workflow(self, simulation_hours=6, num_particles=16):
+    def run_complete_workflow(self, simulation_hours=6, num_particles=16, release_locations=None):
         """Run the complete SCHISM to PlasticParcels workflow."""
         print("🌊 SCHISM TO PLASTICPARCELS COMPLETE WORKFLOW 🌊")
         print("=" * 60)
+
+        # Print configuration summary
+        if self.lon_bounds or self.lat_bounds:
+            print(f"📍 Spatial subsetting: lon={self.lon_bounds}, lat={self.lat_bounds}")
+        else:
+            print("📍 Using full SCHISM domain")
+
+        if release_locations:
+            print(f"🎯 Custom release locations: {len(release_locations['lons']) if isinstance(release_locations, dict) else len(release_locations)} points")
+        else:
+            print(f"🎯 Default release grid: {num_particles} particles")
+
+        print(f"⏱️  Simulation duration: {simulation_hours} hours")
+        print(f"🔍 Target resolution: {self.target_resolution}° ({self.target_resolution * 111.32:.1f} km)")
+        print()
 
         try:
             # Step 1: Load SCHISM data
@@ -535,7 +641,7 @@ SOURCE: SCHISM regridded to NEMO
             self.create_settings_file()
 
             # Step 6: Run simulation
-            self.run_simulation(simulation_hours, num_particles)
+            self.run_simulation(simulation_hours, num_particles, release_locations)
 
             # Step 7: Create visualization
             plot_file = self.create_visualization()
@@ -552,6 +658,12 @@ SOURCE: SCHISM regridded to NEMO
             print(f"   • Settings file: {self.settings_file}")
             print(f"   • Trajectory plot: {plot_file}")
             print()
+            if self.lon_bounds or self.lat_bounds:
+                print(f"📊 DOMAIN SUMMARY:")
+                print(f"   • Original SCHISM domain: {len(self.ds['SCHISM_hgrid_node_x'])} nodes")
+                print(f"   • Subset domain: {len(self.lons)} nodes ({len(self.lons)/len(self.ds['SCHISM_hgrid_node_x'])*100:.1f}%)")
+                print(f"   • Target grid: {len(self.target_lats)}×{len(self.target_lons)} = {len(self.target_lats)*len(self.target_lons)} points")
+                print()
             print("🚀 Your SCHISM data is now fully compatible with PlasticParcels!")
 
             return True
@@ -568,37 +680,142 @@ SOURCE: SCHISM regridded to NEMO
                 self.ds.close()
 
 
+def parse_bounds(bounds_str):
+    """Parse bounds string like 'lon_min,lon_max' into tuple."""
+    if bounds_str is None:
+        return None
+    try:
+        values = [float(x.strip()) for x in bounds_str.split(',')]
+        if len(values) != 2:
+            raise ValueError("Bounds must have exactly 2 values")
+        return tuple(values)
+    except Exception as e:
+        raise ValueError(f"Invalid bounds format '{bounds_str}': {e}")
+
+def parse_release_locations(locations_str):
+    """Parse release locations string like 'lon1,lat1;lon2,lat2;...' into list."""
+    if locations_str is None:
+        return None
+    try:
+        locations = []
+        for loc_str in locations_str.split(';'):
+            lon, lat = [float(x.strip()) for x in loc_str.split(',')]
+            locations.append((lon, lat))
+        return locations
+    except Exception as e:
+        raise ValueError(f"Invalid release locations format '{locations_str}': {e}")
+
 def main():
     """Main function with command line interface."""
-    parser = argparse.ArgumentParser(description='Convert SCHISM output to PlasticParcels format')
+    parser = argparse.ArgumentParser(
+        description='Convert SCHISM output to PlasticParcels format with spatial subsetting and custom release locations',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic usage
+  python %(prog)s --schism_file out2d_1.nc
+
+  # Subset domain to specific region
+  python %(prog)s --schism_file out2d_1.nc --lon_bounds -82,-78 --lat_bounds 32,36
+
+  # Custom release locations
+  python %(prog)s --schism_file out2d_1.nc --release_locations "-80.5,32.0;-80.3,32.2;-80.1,32.4"
+
+  # Full customization
+  python %(prog)s --schism_file out2d_1.nc \\
+    --output_dir my_simulation \\
+    --lon_bounds -81,-79 --lat_bounds 31.5,32.5 \\
+    --resolution 0.005 --hours 12 \\
+    --release_locations "-80.5,32.0;-80.3,32.2"
+        """)
+
+    # Required arguments
     parser.add_argument('--schism_file', required=True,
                        help='Path to SCHISM output file (e.g., out2d_1.nc)')
+
+    # Output options
     parser.add_argument('--output_dir', default='schism_nemo_output',
-                       help='Output directory for NEMO-format files')
+                       help='Output directory for NEMO-format files (default: schism_nemo_output)')
     parser.add_argument('--resolution', type=float, default=0.01,
-                       help='Target grid resolution in degrees (default: 0.01)')
+                       help='Target grid resolution in degrees (default: 0.01, ~1.1km)')
+
+    # Spatial subsetting options
+    parser.add_argument('--lon_bounds', type=str, default=None,
+                       help='Longitude bounds as "lon_min,lon_max" (e.g., "-82,-78")')
+    parser.add_argument('--lat_bounds', type=str, default=None,
+                       help='Latitude bounds as "lat_min,lat_max" (e.g., "32,36")')
+
+    # Simulation options
     parser.add_argument('--hours', type=int, default=6,
                        help='Simulation duration in hours (default: 6)')
     parser.add_argument('--particles', type=int, default=16,
-                       help='Number of particles to release (default: 16)')
+                       help='Number of particles for default grid (default: 16)')
+
+    # Release location options
+    parser.add_argument('--release_locations', type=str, default=None,
+                       help='Custom release locations as "lon1,lat1;lon2,lat2;..." (e.g., "-80.5,32.0;-80.3,32.2")')
 
     args = parser.parse_args()
 
-    # Check if SCHISM file exists
+    # Validate inputs
     if not os.path.exists(args.schism_file):
         print(f"❌ Error: SCHISM file not found: {args.schism_file}")
         return False
+
+    # Parse bounds
+    try:
+        lon_bounds = parse_bounds(args.lon_bounds)
+        lat_bounds = parse_bounds(args.lat_bounds)
+        release_locations = parse_release_locations(args.release_locations)
+    except ValueError as e:
+        print(f"❌ Error: {e}")
+        return False
+
+    # Validate bounds
+    if lon_bounds and lon_bounds[0] >= lon_bounds[1]:
+        print(f"❌ Error: Invalid longitude bounds: {lon_bounds[0]} >= {lon_bounds[1]}")
+        return False
+    if lat_bounds and lat_bounds[0] >= lat_bounds[1]:
+        print(f"❌ Error: Invalid latitude bounds: {lat_bounds[0]} >= {lat_bounds[1]}")
+        return False
+
+    # Print configuration
+    print("🔧 CONFIGURATION:")
+    print(f"   SCHISM file: {args.schism_file}")
+    print(f"   Output directory: {args.output_dir}")
+    print(f"   Resolution: {args.resolution}° ({args.resolution * 111.32:.1f} km)")
+    if lon_bounds:
+        print(f"   Longitude bounds: {lon_bounds[0]}° to {lon_bounds[1]}°E")
+    if lat_bounds:
+        print(f"   Latitude bounds: {lat_bounds[0]}° to {lat_bounds[1]}°N")
+    if release_locations:
+        print(f"   Custom release locations: {len(release_locations)} points")
+    else:
+        print(f"   Default release grid: {args.particles} particles")
+    print(f"   Simulation duration: {args.hours} hours")
+    print()
 
     # Create converter and run workflow
     converter = SCHISMToPlasticParcels(
         schism_file=args.schism_file,
         output_dir=args.output_dir,
-        target_resolution=args.resolution
+        target_resolution=args.resolution,
+        lon_bounds=lon_bounds,
+        lat_bounds=lat_bounds
     )
+
+    # Convert release locations to dict format if provided
+    release_dict = None
+    if release_locations:
+        release_dict = {
+            'lons': [loc[0] for loc in release_locations],
+            'lats': [loc[1] for loc in release_locations]
+        }
 
     success = converter.run_complete_workflow(
         simulation_hours=args.hours,
-        num_particles=args.particles
+        num_particles=args.particles,
+        release_locations=release_dict
     )
 
     return success
