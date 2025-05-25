@@ -223,14 +223,47 @@ class SCHISMTimeSeriesConverter:
             print(f"   Processing time step {t+1}/{n_times}")
 
             # Extract data for this time step
-            if self.spatial_mask is not None:
-                u_data = self.combined_ds['depthAverageVelX'][t, :].values[self.spatial_mask]
-                v_data = self.combined_ds['depthAverageVelY'][t, :].values[self.spatial_mask]
-                elev_data = self.combined_ds['elevation'][t, :].values[self.spatial_mask]
-            else:
-                u_data = self.combined_ds['depthAverageVelX'][t, :].values
-                v_data = self.combined_ds['depthAverageVelY'][t, :].values
-                elev_data = self.combined_ds['elevation'][t, :].values
+            # Handle different data structures (with or without explicit time indexing)
+            try:
+                if len(self.combined_ds['depthAverageVelX'].shape) == 2:
+                    # Data has time dimension: (time, nodes)
+                    if self.spatial_mask is not None:
+                        u_data = self.combined_ds['depthAverageVelX'][t, :].values[self.spatial_mask]
+                        v_data = self.combined_ds['depthAverageVelY'][t, :].values[self.spatial_mask]
+                        elev_data = self.combined_ds['elevation'][t, :].values[self.spatial_mask]
+                    else:
+                        u_data = self.combined_ds['depthAverageVelX'][t, :].values
+                        v_data = self.combined_ds['depthAverageVelY'][t, :].values
+                        elev_data = self.combined_ds['elevation'][t, :].values
+                else:
+                    # Data is 1D: (nodes,) - single time step per file
+                    if self.spatial_mask is not None:
+                        u_data = self.combined_ds['depthAverageVelX'].values[self.spatial_mask]
+                        v_data = self.combined_ds['depthAverageVelY'].values[self.spatial_mask]
+                        elev_data = self.combined_ds['elevation'].values[self.spatial_mask]
+                    else:
+                        u_data = self.combined_ds['depthAverageVelX'].values
+                        v_data = self.combined_ds['depthAverageVelY'].values
+                        elev_data = self.combined_ds['elevation'].values
+            except IndexError as e:
+                print(f"     IndexError at time step {t}: {e}")
+                print(f"     Data shape: {self.combined_ds['depthAverageVelX'].shape}")
+                print(f"     Trying alternative indexing...")
+
+                # Fallback: assume single time step per file, use file index
+                file_idx = t % len(self.time_info)
+                ds_single = xr.open_dataset(self.time_info[file_idx]['file'])
+
+                if self.spatial_mask is not None:
+                    u_data = ds_single['depthAverageVelX'].values.flatten()[self.spatial_mask]
+                    v_data = ds_single['depthAverageVelY'].values.flatten()[self.spatial_mask]
+                    elev_data = ds_single['elevation'].values.flatten()[self.spatial_mask]
+                else:
+                    u_data = ds_single['depthAverageVelX'].values.flatten()
+                    v_data = ds_single['depthAverageVelY'].values.flatten()
+                    elev_data = ds_single['elevation'].values.flatten()
+
+                ds_single.close()
 
             # Regrid each variable
             for var_name, data in [('U', u_data), ('V', v_data), ('elevation', elev_data)]:
@@ -248,13 +281,31 @@ class SCHISMTimeSeriesConverter:
 
         # Create bathymetry (time-independent)
         print("   Creating bathymetry...")
-        bathy_regridded = griddata(
-            points=np.column_stack([self.lons, self.lats]),
-            values=self.depths,
-            xi=np.column_stack([self.target_lon_2d.flatten(), self.target_lat_2d.flatten()]),
-            method='linear',
-            fill_value=0.0
-        ).reshape(self.target_lon_2d.shape)
+
+        # Check for data consistency
+        print(f"     Coordinate points: {len(self.lons)}")
+        print(f"     Depth values: {len(self.depths)}")
+
+        # Remove NaN values from bathymetry data
+        valid_mask = ~np.isnan(self.depths) & ~np.isnan(self.lons) & ~np.isnan(self.lats)
+        valid_lons = self.lons[valid_mask]
+        valid_lats = self.lats[valid_mask]
+        valid_depths = self.depths[valid_mask]
+
+        print(f"     Valid points after NaN removal: {len(valid_lons)}")
+
+        if len(valid_lons) == 0:
+            print("     Warning: No valid bathymetry data, using zero depth")
+            bathy_regridded = np.zeros(self.target_lon_2d.shape)
+        else:
+            bathy_regridded = griddata(
+                points=np.column_stack([valid_lons, valid_lats]),
+                values=valid_depths,
+                xi=np.column_stack([self.target_lon_2d.flatten(), self.target_lat_2d.flatten()]),
+                method='linear',
+                fill_value=0.0
+            ).reshape(self.target_lon_2d.shape)
+
         self.regridded_data['bathymetry'] = bathy_regridded
 
     def save_nemo_timeseries(self):
@@ -306,9 +357,11 @@ class SCHISMTimeSeriesConverter:
 
     def _save_mesh_files(self):
         """Save mesh and bathymetry files."""
-        # Mesh file
+        # Mesh file with both variable names for compatibility
         mesh_ds = xr.Dataset({
-            'glamf': (['y', 'x'], self.target_lon_2d),
+            'nav_lon': (['y', 'x'], self.target_lon_2d),
+            'nav_lat': (['y', 'x'], self.target_lat_2d),
+            'glamf': (['y', 'x'], self.target_lon_2d),  # Keep both for compatibility
             'gphif': (['y', 'x'], self.target_lat_2d),
         })
         mesh_file = os.path.join(self.output_dir, 'ocean_mesh_hgr.nc')

@@ -40,7 +40,8 @@ def create_hydrodynamic_fieldset(settings):
     wfiles = select_files(dirread_model, 'W_%4i*.nc', startdate, runtime, dt_margin=3)
     tfiles = select_files(dirread_model, 'T_%4i*.nc', startdate, runtime, dt_margin=3)
     sfiles = select_files(dirread_model, 'S_%4i*.nc', startdate, runtime, dt_margin=3)
-
+    #import ipdb
+    #ipdb.set_trace()
     filenames = {'U': {'lon': ocean_mesh, 'lat': ocean_mesh, 'depth': wfiles[0], 'data': ufiles},
                  'V': {'lon': ocean_mesh, 'lat': ocean_mesh, 'depth': wfiles[0], 'data': vfiles},
                  'W': {'lon': ocean_mesh, 'lat': ocean_mesh, 'depth': wfiles[0], 'data': wfiles},
