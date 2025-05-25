@@ -9,3 +9,28 @@ docs/_build/*
 .vscode
 _version_setup.py
 
+# Mobile Bay SCHISM Integration - Temporary/Diagnostic Files
+mobile_schism_diagnostic_comparison.py
+test_diagnostic_comparison.py
+debug_*.py
+simple_plot_trajectories.py
+plot_comparison_trajectories.py
+test_single_hour_diagnostic.py
+run_schism_example.py
+mobile_schism_single_hour.py
+test_mobile_bay_hourly.py
+
+# Mobile Bay test data directories
+mobile_6hour_*/
+mobile_daily_format/
+mobile_single_hour/
+mobile_bay_test/
+mobile_bay_production/
+test_output/
+
+# Generated output files
+*.png
+*.log
+*.nc
+trajectories_*
+
