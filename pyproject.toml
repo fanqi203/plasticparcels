@@ -29,6 +29,10 @@ dependencies = [
     "shapely",
     "geopandas",
     "pytest",
+    "fastapi",
+    "uvicorn[standard]",
+    "python-multipart",
+    "aiofiles",
 ]
 
 [project.urls]
