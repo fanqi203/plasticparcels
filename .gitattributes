@@ -1,1 +1,2 @@
 .git_archival.txt  export-subst
+*.nc filter=lfs diff=lfs merge=lfs -text
