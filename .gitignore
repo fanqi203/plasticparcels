@@ -1,3 +1,4 @@
+*.nc
 input_data/
 **.code-workspace*
 **.DS_store**
