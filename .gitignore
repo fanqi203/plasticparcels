@@ -34,3 +34,6 @@ test_output/
 *.nc
 trajectories_*
 
+
+# Directory for files to be deleted
+to_delete/
