@@ -306,6 +306,295 @@ def simulate_trajectories():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route('/vector-field', methods=['GET'])
+def get_vector_field():
+    """Get vector field data for a specific timestamp and bounding box."""
+    try:
+        # Get query parameters
+        timestamp = request.args.get('timestamp')
+        lat_min = float(request.args.get('lat_min', 30.2))
+        lat_max = float(request.args.get('lat_max', 30.8))
+        lon_min = float(request.args.get('lon_min', -88.6))
+        lon_max = float(request.args.get('lon_max', -87.8))
+        grid_density = int(request.args.get('grid_density', 15))
+        
+        if not timestamp:
+            return jsonify({"error": "timestamp parameter required"}), 400
+            
+        # Parse timestamp to find appropriate NetCDF files
+        try:
+            import pandas as pd
+            # More robust timestamp parsing
+            if timestamp.endswith('Z'):
+                timestamp_clean = timestamp[:-1] + '+00:00'
+            else:
+                timestamp_clean = timestamp
+            
+            # Try multiple parsing methods
+            try:
+                dt = datetime.fromisoformat(timestamp_clean)
+            except:
+                dt = pd.to_datetime(timestamp).to_pydatetime()
+            
+            date_str = dt.strftime('%Y-%m-%d')
+            print(f"Parsed timestamp {timestamp} -> date {date_str}")
+        except Exception as e:
+            print(f"Timestamp parsing error: {e}")
+            # Fallback to a default date if parsing fails
+            date_str = '2024-01-01'
+            print(f"Using fallback date: {date_str}")
+            
+        # Find U and V files for the date
+        u_file = os.path.join(DATA_DIR, f'U_{date_str}.nc')
+        v_file = os.path.join(DATA_DIR, f'V_{date_str}.nc')
+        
+        if not os.path.exists(u_file) or not os.path.exists(v_file):
+            # Try to find the closest available date
+            available_files = [f for f in os.listdir(DATA_DIR) if f.startswith('U_') and f.endswith('.nc')]
+            if available_files:
+                # Use the first available file as fallback
+                u_file = os.path.join(DATA_DIR, available_files[0])
+                v_file = os.path.join(DATA_DIR, available_files[0].replace('U_', 'V_'))
+                print(f"Using fallback files: {u_file}, {v_file}")
+            else:
+                return jsonify({"error": f"No ocean current data available for {date_str}"}), 404
+                
+        # Load NetCDF data
+        u_ds = xr.open_dataset(u_file)
+        v_ds = xr.open_dataset(v_file)
+        
+        # Get variable names for SCHISM ocean model
+        # U variable is 'vozocrtx', V variable is 'vomecrty'
+        u_var = None
+        v_var = None
+        
+        # Check for SCHISM variable names first
+        if 'vozocrtx' in u_ds.data_vars:
+            u_var = 'vozocrtx'
+        elif 'u' in u_ds.data_vars:
+            u_var = 'u'
+        else:
+            # Try other common names
+            for var in u_ds.data_vars:
+                if var.lower() in ['u', 'eastward_velocity', 'u_velocity']:
+                    u_var = var
+                    break
+                    
+        if 'vomecrty' in v_ds.data_vars:
+            v_var = 'vomecrty'
+        elif 'v' in v_ds.data_vars:
+            v_var = 'v'
+        else:
+            # Try other common names
+            for var in v_ds.data_vars:
+                if var.lower() in ['v', 'northward_velocity', 'v_velocity']:
+                    v_var = var
+                    break
+                
+        if u_var is None or v_var is None:
+            available_vars = list(u_ds.data_vars) + list(v_ds.data_vars)
+            return jsonify({"error": f"Could not find U/V velocity variables. Available: {available_vars}"}), 500
+            
+        print(f"Using variables: U={u_var}, V={v_var}")
+            
+        # Get the appropriate time step based on requested timestamp
+        # SCHISM uses 'time_counter' instead of 'time'
+        u_full = u_ds[u_var]
+        v_full = v_ds[v_var]
+        
+        # Find the best time index for the requested timestamp
+        time_index = 0  # Default to first time step
+        
+        if 'time_counter' in u_full.dims:
+            time_coords = u_full.time_counter.values
+            print(f"Available time steps: {len(time_coords)}")
+            print(f"Time range: {time_coords[0]} to {time_coords[-1]}")
+            
+            # Parse the requested timestamp - simplified approach
+            try:
+                import numpy as np
+                from datetime import datetime
+                import pandas as pd
+                
+                print(f"Raw timestamp received: {timestamp}")
+                
+                # Parse the requested timestamp
+                if timestamp.endswith('Z'):
+                    timestamp = timestamp[:-1] + '+00:00'
+                
+                requested_time = pd.to_datetime(timestamp)
+                print(f"Parsed requested time: {requested_time}")
+                
+                # Convert time coordinates to pandas datetime for easier comparison
+                time_coords_pd = pd.to_datetime(time_coords)
+                print(f"Time coords range: {time_coords_pd[0]} to {time_coords_pd[-1]}")
+                
+                # Find the closest time index
+                time_diffs = np.abs(time_coords_pd - requested_time)
+                time_index = int(np.argmin(time_diffs))
+                
+                closest_time = time_coords_pd[time_index]
+                print(f"Using time index {time_index}: {closest_time}")
+                
+            except Exception as e:
+                print(f"Error parsing timestamp: {e}")
+                print(f"Timestamp type: {type(timestamp)}")
+                print(f"Time coords type: {type(time_coords)}")
+                print(f"Time coords sample: {time_coords[:3] if len(time_coords) > 0 else 'empty'}")
+                # For now, use a simple hour-based approach as fallback
+                try:
+                    # Extract hour from timestamp and use modulo for cycling
+                    hour_match = timestamp.split('T')[1].split(':')[0] if 'T' in timestamp else '0'
+                    hour = int(hour_match) % len(time_coords)
+                    time_index = hour
+                    print(f"Fallback: using hour-based index {time_index}")
+                except:
+                    time_index = 0
+                    print("Using first time step as final fallback")
+            
+            u_data = u_full.isel(time_counter=time_index)
+            v_data = v_full.isel(time_counter=time_index)
+            
+        elif 'time' in u_full.dims:
+            # Similar logic for 'time' dimension
+            time_coords = u_full.time.values
+            try:
+                from datetime import datetime
+                import numpy as np
+                
+                requested_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                requested_np_time = np.datetime64(requested_time)
+                time_diffs = np.abs(time_coords - requested_np_time)
+                time_index = int(np.argmin(time_diffs))
+                print(f"Using time index {time_index} from 'time' dimension")
+            except Exception as e:
+                print(f"Error parsing timestamp for 'time' dimension: {e}")
+                time_index = 0
+                
+            u_data = u_full.isel(time=time_index)
+            v_data = v_full.isel(time=time_index)
+            
+        else:
+            # Use first time step regardless of dimension name
+            time_dims = [d for d in u_full.dims if 'time' in d.lower()]
+            if time_dims:
+                time_dim = time_dims[0]
+                u_data = u_full.isel({time_dim: 0})
+                v_data = v_full.isel({time_dim: 0})
+                print(f"Using first time step from dimension: {time_dim}")
+            else:
+                # No time dimension, use data as is
+                u_data = u_full
+                v_data = v_full
+                print("No time dimension found, using data as-is")
+        
+        # Get coordinate arrays for SCHISM format
+        # SCHISM uses 'nav_lat' and 'nav_lon' coordinates
+        if 'nav_lat' in u_data.coords and 'nav_lon' in u_data.coords:
+            lats = u_data.nav_lat.values
+            lons = u_data.nav_lon.values
+            print(f"Using SCHISM coordinates: nav_lat, nav_lon")
+        elif 'lat' in u_data.coords:
+            lats = u_data.lat.values
+            lons = u_data.lon.values
+        elif 'latitude' in u_data.coords:
+            lats = u_data.latitude.values
+            lons = u_data.longitude.values
+        else:
+            available_coords = list(u_data.coords)
+            return jsonify({"error": f"Could not find lat/lon coordinates. Available: {available_coords}"}), 500
+            
+        print(f"Coordinate shapes: lats={lats.shape}, lons={lons.shape}")
+            
+        # Create meshgrid if needed
+        if len(lats.shape) == 1 and len(lons.shape) == 1:
+            lon_grid, lat_grid = np.meshgrid(lons, lats)
+        else:
+            lat_grid = lats
+            lon_grid = lons
+            
+        # Filter data to bounding box
+        lat_mask = (lat_grid >= lat_min) & (lat_grid <= lat_max)
+        lon_mask = (lon_grid >= lon_min) & (lon_grid <= lon_max)
+        mask = lat_mask & lon_mask
+        
+        # Subsample based on grid density
+        if len(lat_grid.shape) == 2:
+            step_lat = max(1, lat_grid.shape[0] // grid_density)
+            step_lon = max(1, lat_grid.shape[1] // grid_density)
+            
+            # Apply subsampling
+            lat_sub = lat_grid[::step_lat, ::step_lon]
+            lon_sub = lon_grid[::step_lat, ::step_lon]
+            mask_sub = mask[::step_lat, ::step_lon]
+            u_sub = u_data.values[::step_lat, ::step_lon]
+            v_sub = v_data.values[::step_lat, ::step_lon]
+        else:
+            # Handle 1D case
+            lat_indices = np.where((lats >= lat_min) & (lats <= lat_max))[0]
+            lon_indices = np.where((lons >= lon_min) & (lons <= lon_max))[0]
+            
+            step_lat = max(1, len(lat_indices) // grid_density)
+            step_lon = max(1, len(lon_indices) // grid_density)
+            
+            lat_sub_idx = lat_indices[::step_lat]
+            lon_sub_idx = lon_indices[::step_lon]
+            
+            lat_sub = lats[lat_sub_idx]
+            lon_sub = lons[lon_sub_idx]
+            
+            # Create subsampled data
+            u_sub = u_data.values[np.ix_(lat_sub_idx, lon_sub_idx)]
+            v_sub = v_data.values[np.ix_(lat_sub_idx, lon_sub_idx)]
+            
+            lon_grid_sub, lat_grid_sub = np.meshgrid(lon_sub, lat_sub)
+            lat_sub = lat_grid_sub
+            lon_sub = lon_grid_sub
+            mask_sub = np.ones_like(lat_sub, dtype=bool)
+            
+        # Create vector field data
+        vectors = []
+        for i in range(lat_sub.shape[0]):
+            for j in range(lat_sub.shape[1]):
+                if mask_sub[i, j] and not (np.isnan(u_sub[i, j]) or np.isnan(v_sub[i, j])):
+                    u_val = float(u_sub[i, j])
+                    v_val = float(v_sub[i, j])
+                    magnitude = float(np.sqrt(u_val**2 + v_val**2))
+                    
+                    vectors.append({
+                        "lat": float(lat_sub[i, j]),
+                        "lng": float(lon_sub[i, j]),
+                        "u": u_val,
+                        "v": v_val,
+                        "magnitude": magnitude
+                    })
+                    
+        # Close datasets
+        u_ds.close()
+        v_ds.close()
+        
+        response_data = {
+            "timestamp": timestamp,
+            "vectors": vectors,
+            "bounds": {
+                "lat_min": lat_min,
+                "lat_max": lat_max,
+                "lon_min": lon_min,
+                "lon_max": lon_max
+            },
+            "grid_density": grid_density,
+            "data_source": "real",
+            "files_used": [u_file, v_file]
+        }
+        
+        return jsonify(response_data)
+        
+    except Exception as e:
+        import traceback
+        print(f"Error in get_vector_field: {e}")
+        print(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/info', methods=['GET'])
 def get_info():
     """Get information about the loaded dataset."""
