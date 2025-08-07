@@ -349,13 +349,49 @@ def get_vector_field():
         v_file = os.path.join(DATA_DIR, f'V_{date_str}.nc')
         
         if not os.path.exists(u_file) or not os.path.exists(v_file):
-            # Try to find the closest available date
+            # Find all available dates and cycle through them based on simulation time
             available_files = [f for f in os.listdir(DATA_DIR) if f.startswith('U_') and f.endswith('.nc')]
             if available_files:
-                # Use the first available file as fallback
-                u_file = os.path.join(DATA_DIR, available_files[0])
-                v_file = os.path.join(DATA_DIR, available_files[0].replace('U_', 'V_'))
-                print(f"Using fallback files: {u_file}, {v_file}")
+                # Extract dates from available files and sort them
+                available_dates = []
+                for f in available_files:
+                    try:
+                        date_part = f.replace('U_', '').replace('.nc', '')
+                        available_dates.append(date_part)
+                    except:
+                        continue
+                
+                available_dates.sort()
+                print(f"Available data dates: {available_dates}")
+                
+                if available_dates:
+                    # Always start from 2024-01-01 and calculate simulation hours from that fixed start
+                    try:
+                        # Fixed simulation start time - always 2024-01-01T00:00:00Z
+                        simulation_start = datetime(2024, 1, 1, 0, 0, 0)
+                        
+                        # Calculate hours elapsed since simulation start (ignore real-world date)
+                        if dt.year == 2024 and dt.month == 1:  # If timestamp is already in simulation timeframe
+                            time_diff = dt - simulation_start
+                            simulation_hour = int(time_diff.total_seconds() // 3600)
+                        else:
+                            # For any other timestamp, extract just the hour and use it as simulation hour
+                            simulation_hour = dt.hour
+                        
+                        day_index = (simulation_hour // 24) % len(available_dates)  # Cycle through days
+                        selected_date = available_dates[day_index]
+                        print(f"Fixed simulation start: 2024-01-01, simulation hour: {simulation_hour}, selected day index: {day_index}, using date: {selected_date}")
+                    except Exception as e:
+                        print(f"Error in simulation time calculation: {e}")
+                        # Fallback to first available date
+                        selected_date = available_dates[0]
+                        print(f"Using fallback date: {selected_date}")
+                    
+                    u_file = os.path.join(DATA_DIR, f'U_{selected_date}.nc')
+                    v_file = os.path.join(DATA_DIR, f'V_{selected_date}.nc')
+                    print(f"Using files: {u_file}, {v_file}")
+                else:
+                    return jsonify({"error": f"No valid ocean current data files found"}), 404
             else:
                 return jsonify({"error": f"No ocean current data available for {date_str}"}), 404
                 
