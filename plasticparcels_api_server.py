@@ -142,7 +142,7 @@ def zarr_to_geojson(zarr_file):
     except Exception as e:
         raise Exception(f"Error converting zarr to GeoJSON: {e}")
 
-def run_trajectory_simulation(release_locations, simulation_hours=72, output_minutes=30, dt_minutes=5):
+def run_trajectory_simulation(release_locations, simulation_hours=72, output_minutes=30, dt_minutes=5, start_date=None):
     """Run PlasticParcels simulation with given release locations."""
     try:
         # Import PlasticParcels
@@ -162,8 +162,31 @@ def run_trajectory_simulation(release_locations, simulation_hours=72, output_min
                 settings['ocean']['directory'] = os.path.join(DATA_DIR, '')
 
         # Add simulation settings
+        # Use provided start_date or determine from available data
+        if start_date is None:
+            # Auto-detect start date from available data files
+            available_files = [f for f in os.listdir(DATA_DIR) if f.startswith('U_') and f.endswith('.nc')]
+            if available_files:
+                # Extract dates and use the earliest one
+                available_dates = []
+                for f in available_files:
+                    try:
+                        date_part = f.replace('U_', '').replace('.nc', '')
+                        date_obj = datetime.strptime(date_part, '%Y-%m-%d')
+                        # Ensure timezone-naive for PlasticParcels compatibility
+                        date_obj = date_obj.replace(tzinfo=None)
+                        available_dates.append(date_obj)
+                    except:
+                        continue
+                if available_dates:
+                    start_date = min(available_dates)
+                else:
+                    start_date = datetime(2024, 1, 1, 0, 0, 0)  # Fallback
+            else:
+                start_date = datetime(2024, 1, 1, 0, 0, 0)  # Fallback
+        
         settings['simulation'] = {
-            'startdate': datetime(2024, 1, 1, 0, 0, 0),
+            'startdate': start_date,
             'runtime': timedelta(hours=simulation_hours),
             'outputdt': timedelta(minutes=output_minutes),
             'dt': timedelta(minutes=dt_minutes),
@@ -240,7 +263,8 @@ def simulate_trajectories():
         },
         "simulation_hours": 72 (optional, default 72),
         "output_minutes": 30 (optional, default 30),
-        "dt_minutes": 5 (optional, default 5)
+        "dt_minutes": 5 (optional, default 5),
+        "start_date": "2025-10-13T00:00:00Z" (optional, auto-detected if not provided)
     }
 
     Returns GeoJSON FeatureCollection with trajectory LineStrings.
@@ -275,6 +299,21 @@ def simulate_trajectories():
         simulation_hours = data.get('simulation_hours', 72)
         output_minutes = data.get('output_minutes', 30)
         dt_minutes = data.get('dt_minutes', 5)
+        
+        # Parse start_date if provided
+        start_date = None
+        if 'start_date' in data:
+            try:
+                start_date_str = data['start_date']
+                if isinstance(start_date_str, str):
+                    # Parse ISO format date string and make it timezone-naive
+                    start_date = datetime.fromisoformat(start_date_str.replace('Z', '+00:00'))
+                    # Convert to timezone-naive datetime for PlasticParcels compatibility
+                    start_date = start_date.replace(tzinfo=None)
+                    print(f"Using user-specified start date: {start_date}")
+            except Exception as e:
+                print(f"Error parsing start_date: {e}. Using auto-detection.")
+                start_date = None
 
         # Validate parameters
         if simulation_hours <= 0 or simulation_hours > 720:  # Max 30 days
@@ -291,7 +330,8 @@ def simulate_trajectories():
             release_locations,
             simulation_hours,
             output_minutes,
-            dt_minutes
+            dt_minutes,
+            start_date
         )
 
         # Convert to GeoJSON
@@ -525,8 +565,12 @@ def get_vector_field():
                 print("No time dimension found, using data as-is")
         
         # Get coordinate arrays for SCHISM format
-        # SCHISM uses 'nav_lat' and 'nav_lon' coordinates
-        if 'nav_lat' in u_data.coords and 'nav_lon' in u_data.coords:
+        # SCHISM uses 'nav_lat' and 'nav_lon' as data variables (not coordinates)
+        if 'nav_lat' in u_ds.data_vars and 'nav_lon' in u_ds.data_vars:
+            lats = u_ds.nav_lat.values
+            lons = u_ds.nav_lon.values
+            print(f"Using SCHISM data variables: nav_lat, nav_lon")
+        elif 'nav_lat' in u_data.coords and 'nav_lon' in u_data.coords:
             lats = u_data.nav_lat.values
             lons = u_data.nav_lon.values
             print(f"Using SCHISM coordinates: nav_lat, nav_lon")
@@ -538,7 +582,8 @@ def get_vector_field():
             lons = u_data.longitude.values
         else:
             available_coords = list(u_data.coords)
-            return jsonify({"error": f"Could not find lat/lon coordinates. Available: {available_coords}"}), 500
+            available_vars = list(u_ds.data_vars)
+            return jsonify({"error": f"Could not find lat/lon coordinates. Available coords: {available_coords}, Available vars: {available_vars}"}), 500
             
         print(f"Coordinate shapes: lats={lats.shape}, lons={lons.shape}")
             
@@ -554,10 +599,24 @@ def get_vector_field():
         lon_mask = (lon_grid >= lon_min) & (lon_grid <= lon_max)
         mask = lat_mask & lon_mask
         
-        # Subsample based on grid density
+        # Subsample based on grid density with aspect ratio correction
         if len(lat_grid.shape) == 2:
-            step_lat = max(1, lat_grid.shape[0] // grid_density)
-            step_lon = max(1, lat_grid.shape[1] // grid_density)
+            # Calculate aspect ratio of the requested region
+            lat_range = lat_max - lat_min
+            lon_range = lon_max - lon_min
+            aspect_ratio = lon_range / lat_range
+            
+            # Adjust grid density for longitude to account for aspect ratio
+            # This ensures more uniform spacing in both directions
+            grid_density_lat = grid_density
+            grid_density_lon = max(grid_density, int(grid_density * aspect_ratio))
+            
+            step_lat = max(1, lat_grid.shape[0] // grid_density_lat)
+            step_lon = max(1, lat_grid.shape[1] // grid_density_lon)
+            
+            print(f"Grid density adjustment: lat_range={lat_range:.1f}°, lon_range={lon_range:.1f}°, aspect_ratio={aspect_ratio:.1f}")
+            print(f"Grid densities: lat={grid_density_lat}, lon={grid_density_lon}")
+            print(f"Steps: lat={step_lat}, lon={step_lon}")
             
             # Apply subsampling
             lat_sub = lat_grid[::step_lat, ::step_lon]
@@ -677,6 +736,47 @@ def get_info():
         }
 
         return jsonify(info)
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/data-range', methods=['GET'])
+def get_data_range():
+    """Get the available data date range."""
+    try:
+        if not DATA_DIR:
+            return jsonify({"error": "Server not initialized"}), 500
+
+        # Find all available U files (velocity data)
+        available_files = [f for f in os.listdir(DATA_DIR) if f.startswith('U_') and f.endswith('.nc')]
+
+        if not available_files:
+            return jsonify({"error": "No data files found"}), 404
+
+        # Extract dates from filenames
+        available_dates = []
+        for f in available_files:
+            try:
+                date_part = f.replace('U_', '').replace('.nc', '')
+                # Validate date format
+                datetime.strptime(date_part, '%Y-%m-%d')
+                available_dates.append(date_part)
+            except ValueError:
+                continue
+
+        if not available_dates:
+            return jsonify({"error": "No valid date files found"}), 404
+
+        available_dates.sort()
+        start_date = available_dates[0]
+        end_date = available_dates[-1]
+
+        return jsonify({
+            "start_date": start_date,
+            "end_date": end_date,
+            "total_days": len(available_dates),
+            "available_dates": available_dates
+        })
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
