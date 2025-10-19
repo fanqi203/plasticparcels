@@ -113,6 +113,13 @@ def convert_subset_to_schism(input_file, output_dir):
             "modelname": "NEMO0083",
             "directory": f"{output_dir}/",
             "filename_style": "",
+            "ocean_mesh": "ocean_mesh_hgr.nc",
+            "bathymetry_mesh": "bathymetry_mesh_zgr.nc",
+            "bathymetry_variables": "mbathy",
+            "bathymetry_dimensions": {
+                "lon": "nav_lon",
+                "lat": "nav_lat"
+            },
             "variables": {
                 "U": "vozocrtx",
                 "V": "vomecrty",
@@ -129,10 +136,14 @@ def convert_subset_to_schism(input_file, output_dir):
         }
     }
     
-    settings_file = os.path.join(output_dir, 'settings.json')
-    import json
-    with open(settings_file, 'w') as f:
-        json.dump(settings, f, indent=2)
+    settings_file = os.path.join(output_dir, "settings.json")
+    if not os.path.exists(settings_file):
+        import json
+        with open(settings_file, "w") as f:
+            json.dump(settings, f, indent=2)
+        print(f"Created new settings file: {settings_file}")
+    else:
+        print(f"Preserved existing settings file: {settings_file}")
     
     print(f"\nConversion complete!")
     print(f"Output directory: {output_dir}")
