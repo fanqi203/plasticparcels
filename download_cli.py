@@ -23,7 +23,7 @@ copernicusmarine subset
   --start-datetime {start_datetime}
   --end-datetime {end_datetime}
   --minimum-longitude -95 --maximum-longitude -70
-  --minimum-latitude 26  --maximum-latitude 31
+  --minimum-latitude 26  --maximum-latitude 35
   --minimum-depth 0 --maximum-depth 50
   --output-filename subset.nc
   --output-directory ./downloads
