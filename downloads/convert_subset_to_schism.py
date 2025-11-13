@@ -100,50 +100,51 @@ def convert_subset_to_schism(input_file, output_dir):
                 ds_out.to_netcdf(output_file)
                 print(f"      Saved: {output_file}")
     
-    # Create settings.json for the new data
-    settings = {
-        "use_3D": False,
-        "allow_time_extrapolation": False,
-        "verbose_delete": False,
-        "use_mixing": False,
-        "use_biofouling": False,
-        "use_stokes": False,
-        "use_wind": False,
-        "ocean": {
-            "modelname": "NEMO0083",
-            "directory": f"{output_dir}/",
-            "filename_style": "",
-            "ocean_mesh": "ocean_mesh_hgr.nc",
-            "bathymetry_mesh": "bathymetry_mesh_zgr.nc",
-            "bathymetry_variables": "mbathy",
-            "bathymetry_dimensions": {
-                "lon": "nav_lon",
-                "lat": "nav_lat"
-            },
-            "variables": {
-                "U": "vozocrtx",
-                "V": "vomecrty",
-                "conservative_temperature": "votemper",
-                "absolute_salinity": "vosaline"
-            },
-            "dimensions": {
-                "U": {"lon": "nav_lon", "lat": "nav_lat", "time": "time_counter"},
-                "V": {"lon": "nav_lon", "lat": "nav_lat", "time": "time_counter"},
-                "conservative_temperature": {"lon": "nav_lon", "lat": "nav_lat", "time": "time_counter"},
-                "absolute_salinity": {"lon": "nav_lon", "lat": "nav_lat", "time": "time_counter"}
-            },
-            "indices": {}
-        }
-    }
-    
-    settings_file = os.path.join(output_dir, "settings.json")
+    # Only create settings.json if it doesn't exist (preserve existing configuration)
+    settings_file = os.path.join(output_dir, 'settings.json')
     if not os.path.exists(settings_file):
+        print("Creating new settings.json file...")
+        settings = {
+            "use_3D": False,
+            "allow_time_extrapolation": False,
+            "verbose_delete": False,
+            "use_mixing": False,
+            "use_biofouling": False,
+            "use_stokes": False,
+            "use_wind": False,
+            "ocean": {
+                "modelname": "NEMO0083",
+                "directory": f"{output_dir}/",
+                "filename_style": "",
+                "ocean_mesh": "ocean_mesh_hgr.nc",
+                "bathymetry_mesh": "bathymetry_mesh_zgr.nc",
+                "bathymetry_variables": "mbathy",
+                "bathymetry_dimensions": {
+                    "lon": "nav_lon",
+                    "lat": "nav_lat"
+                },
+                "variables": {
+                    "U": "vozocrtx",
+                    "V": "vomecrty",
+                    "conservative_temperature": "votemper",
+                    "absolute_salinity": "vosaline"
+                },
+                "dimensions": {
+                    "U": {"lon": "nav_lon", "lat": "nav_lat", "time": "time_counter"},
+                    "V": {"lon": "nav_lon", "lat": "nav_lat", "time": "time_counter"},
+                    "conservative_temperature": {"lon": "nav_lon", "lat": "nav_lat", "time": "time_counter"},
+                    "absolute_salinity": {"lon": "nav_lon", "lat": "nav_lat", "time": "time_counter"}
+                },
+                "indices": {}
+            }
+        }
+        
         import json
-        with open(settings_file, "w") as f:
+        with open(settings_file, 'w') as f:
             json.dump(settings, f, indent=2)
-        print(f"Created new settings file: {settings_file}")
+        print(f"✅ Created new settings file: {settings_file}")
     else:
-        print(f"Preserved existing settings file: {settings_file}")
+        print(f"✅ Preserved existing settings file: {settings_file}")
     
     print(f"\nConversion complete!")
     print(f"Output directory: {output_dir}")
