@@ -31,6 +31,58 @@ CORS(app,
 # Global configuration
 DATA_DIR = None
 SETTINGS = None
+LAND_MASK = None  # 2D boolean array: True = land, False = ocean
+
+def build_land_mask(data_dir):
+    """Build a 2D land mask for the data grid using Natural Earth coastline."""
+    try:
+        from shapely.geometry import Point
+        from shapely.prepared import prep
+        import cartopy.io.shapereader as shpreader
+        from shapely.ops import unary_union
+
+        # Load Natural Earth 50m coastline
+        land_shp = shpreader.natural_earth(resolution='50m', category='physical', name='land')
+        reader = shpreader.Reader(land_shp)
+        land = unary_union(list(reader.geometries()))
+        land_prep = prep(land)
+
+        # Read grid coordinates from first available U file
+        u_files = sorted([f for f in os.listdir(data_dir) if f.startswith('U_') and f.endswith('.nc')])
+        if not u_files:
+            print("⚠️  No U files found, cannot build land mask")
+            return None
+
+        ds = xr.open_dataset(os.path.join(data_dir, u_files[0]))
+        if 'nav_lat' in ds.data_vars or 'nav_lat' in ds.coords:
+            nav_lat = ds['nav_lat'].values
+            nav_lon = ds['nav_lon'].values
+        else:
+            print("⚠️  No nav_lat/nav_lon in data, cannot build land mask")
+            ds.close()
+            return None
+        ds.close()
+
+        ny, nx = nav_lat.shape
+        mask = np.zeros((ny, nx), dtype=bool)
+        for i in range(ny):
+            for j in range(nx):
+                mask[i, j] = land_prep.contains(Point(float(nav_lon[i, j]), float(nav_lat[i, j])))
+
+        # Store grid bounds for index lookup
+        lat_min_grid = float(nav_lat.min())
+        lat_max_grid = float(nav_lat.max())
+        lon_min_grid = float(nav_lon.min())
+        lon_max_grid = float(nav_lon.max())
+        print(f"🗺️  Land mask built: {mask.sum()} land / {(~mask).sum()} ocean points ({ny}×{nx} grid)")
+        print(f"    Grid bounds: lat [{lat_min_grid}, {lat_max_grid}], lon [{lon_min_grid}, {lon_max_grid}]")
+        return {'mask': mask, 'lat_min': lat_min_grid, 'lat_max': lat_max_grid,
+                'lon_min': lon_min_grid, 'lon_max': lon_max_grid, 'ny': ny, 'nx': nx}
+
+    except Exception as e:
+        print(f"⚠️  Could not build land mask: {e}")
+        return None
+
 
 def load_mobile_bay_settings(data_dir):
     """Load Mobile Bay settings from the data directory."""
@@ -53,6 +105,7 @@ def zarr_to_geojson(zarr_file):
         # Extract trajectory data
         lons = ds.lon.values
         lats = ds.lat.values
+        depths = ds.z.values if 'z' in ds else None
         times = ds.time.values if 'time' in ds else None
 
         # Handle different data shapes
@@ -70,8 +123,13 @@ def zarr_to_geojson(zarr_file):
                     # Remove NaN values
                     valid = ~np.isnan(p_lons) & ~np.isnan(p_lats)
                     if np.any(valid):
-                        coordinates = [[float(lon), float(lat)]
-                                     for lon, lat in zip(p_lons[valid], p_lats[valid])]
+                        if depths is not None:
+                            p_depths = depths[p, :]
+                            coordinates = [[float(lon), float(lat), float(dep)]
+                                         for lon, lat, dep in zip(p_lons[valid], p_lats[valid], p_depths[valid])]
+                        else:
+                            coordinates = [[float(lon), float(lat)]
+                                         for lon, lat in zip(p_lons[valid], p_lats[valid])]
 
                         feature = {
                             "type": "Feature",
@@ -95,8 +153,13 @@ def zarr_to_geojson(zarr_file):
                     # Remove NaN values
                     valid = ~np.isnan(p_lons) & ~np.isnan(p_lats)
                     if np.any(valid):
-                        coordinates = [[float(lon), float(lat)]
-                                     for lon, lat in zip(p_lons[valid], p_lats[valid])]
+                        if depths is not None:
+                            p_depths = depths[:, p]
+                            coordinates = [[float(lon), float(lat), float(dep)]
+                                         for lon, lat, dep in zip(p_lons[valid], p_lats[valid], p_depths[valid])]
+                        else:
+                            coordinates = [[float(lon), float(lat)]
+                                         for lon, lat in zip(p_lons[valid], p_lats[valid])]
 
                         feature = {
                             "type": "Feature",
@@ -114,8 +177,12 @@ def zarr_to_geojson(zarr_file):
             # Single particle: 1D array
             valid = ~np.isnan(lons) & ~np.isnan(lats)
             if np.any(valid):
-                coordinates = [[float(lon), float(lat)]
-                             for lon, lat in zip(lons[valid], lats[valid])]
+                if depths is not None:
+                    coordinates = [[float(lon), float(lat), float(dep)]
+                                 for lon, lat, dep in zip(lons[valid], lats[valid], depths[valid])]
+                else:
+                    coordinates = [[float(lon), float(lat)]
+                                 for lon, lat in zip(lons[valid], lats[valid])]
 
                 feature = {
                     "type": "Feature",
@@ -142,7 +209,7 @@ def zarr_to_geojson(zarr_file):
     except Exception as e:
         raise Exception(f"Error converting zarr to GeoJSON: {e}")
 
-def run_trajectory_simulation(release_locations, simulation_hours=72, output_minutes=30, dt_minutes=5, start_date=None):
+def run_trajectory_simulation(release_locations, simulation_hours=72, output_minutes=30, dt_minutes=5, start_date=None, plastic_density=None, plastic_diameter=None):
     """Run PlasticParcels simulation with given release locations."""
     try:
         # Import PlasticParcels
@@ -194,9 +261,10 @@ def run_trajectory_simulation(release_locations, simulation_hours=72, output_min
 
         settings['plastictype'] = {
             'wind_coefficient': 0.0,
-            'plastic_diameter': 0.001,
-            'plastic_density': 1028.0,
+            'plastic_diameter': plastic_diameter if plastic_diameter is not None else 0.001,
+            'plastic_density': plastic_density if plastic_density is not None else 1028.0,
         }
+        print(f"Plastic properties: diameter={settings['plastictype']['plastic_diameter']}m, density={settings['plastictype']['plastic_density']}kg/m3")
 
         # Create fieldset
         fieldset = create_hydrodynamic_fieldset(settings)
@@ -211,9 +279,18 @@ def run_trajectory_simulation(release_locations, simulation_hours=72, output_min
         # Remove the temporary file (we just need the name)
         os.unlink(output_file)
 
+        # Build kernel list based on 3D/2D mode
+        if settings.get('use_3D', False):
+            from plasticparcels.constructors import create_kernel
+            kernels = create_kernel(fieldset)
+            print(f"Running 3D simulation with full kernel chain (including SettlingVelocity)...")
+        else:
+            kernels = parcels.AdvectionRK4
+            print(f"Running 2D simulation (horizontal advection only)...")
+
         # Run simulation
         pset.execute(
-            parcels.AdvectionRK4,
+            kernels,
             runtime=settings['simulation']['runtime'],
             dt=settings['simulation']['dt'],
             output_file=pset.ParticleFile(name=output_file, outputdt=settings['simulation']['outputdt'])
@@ -325,13 +402,23 @@ def simulate_trajectories():
         if dt_minutes <= 0 or dt_minutes > 60:  # Max 1 hour
             return jsonify({"error": "dt_minutes must be between 1 and 60"}), 400
 
+        # Get plastic properties from request (optional)
+        plastic_density = data.get('plastic_density', None)
+        plastic_diameter = data.get('plastic_diameter', None)
+        if plastic_density is not None:
+            plastic_density = float(plastic_density)
+        if plastic_diameter is not None:
+            plastic_diameter = float(plastic_diameter)
+
         # Run simulation
         output_file = run_trajectory_simulation(
             release_locations,
             simulation_hours,
             output_minutes,
             dt_minutes,
-            start_date
+            start_date,
+            plastic_density,
+            plastic_diameter
         )
 
         # Convert to GeoJSON
@@ -564,6 +651,19 @@ def get_vector_field():
                 v_data = v_full
                 print("No time dimension found, using data as-is")
         
+        # If data has a depth dimension, select surface level (index 0)
+        for depth_dim in ['depthw', 'depthu', 'depthv', 'depth']:
+            if depth_dim in u_data.dims:
+                u_data = u_data.isel({depth_dim: 0})
+                print(f"Selected surface level from depth dimension: {depth_dim}")
+                break
+        for depth_dim in ['depthw', 'depthu', 'depthv', 'depth']:
+            if depth_dim in v_data.dims:
+                v_data = v_data.isel({depth_dim: 0})
+                break
+        
+        print(f"u_data shape after time/depth selection: {u_data.shape}")
+
         # Get coordinate arrays for SCHISM format
         # SCHISM uses 'nav_lat' and 'nav_lon' as data variables (not coordinates)
         if 'nav_lat' in u_ds.data_vars and 'nav_lon' in u_ds.data_vars:
@@ -647,11 +747,22 @@ def get_vector_field():
             lon_sub = lon_grid_sub
             mask_sub = np.ones_like(lat_sub, dtype=bool)
             
-        # Create vector field data
+        # Create vector field data (skip land points using precomputed land mask)
         vectors = []
         for i in range(lat_sub.shape[0]):
             for j in range(lat_sub.shape[1]):
                 if mask_sub[i, j] and not (np.isnan(u_sub[i, j]) or np.isnan(v_sub[i, j])):
+                    # Skip land points if land mask is available
+                    if LAND_MASK is not None:
+                        lm = LAND_MASK
+                        lat_val = float(lat_sub[i, j])
+                        lon_val = float(lon_sub[i, j])
+                        gi = int(round((lat_val - lm['lat_min']) / (lm['lat_max'] - lm['lat_min']) * (lm['ny'] - 1)))
+                        gj = int(round((lon_val - lm['lon_min']) / (lm['lon_max'] - lm['lon_min']) * (lm['nx'] - 1)))
+                        gi = max(0, min(gi, lm['ny'] - 1))
+                        gj = max(0, min(gj, lm['nx'] - 1))
+                        if lm['mask'][gi, gj]:
+                            continue
                     u_val = float(u_sub[i, j])
                     v_val = float(v_sub[i, j])
                     magnitude = float(np.sqrt(u_val**2 + v_val**2))
@@ -783,7 +894,7 @@ def get_data_range():
 
 def initialize_server(data_dir):
     """Initialize the server with Mobile Bay data."""
-    global DATA_DIR, SETTINGS
+    global DATA_DIR, SETTINGS, LAND_MASK
 
     if not os.path.exists(data_dir):
         raise FileNotFoundError(f"Data directory not found: {data_dir}")
@@ -791,6 +902,9 @@ def initialize_server(data_dir):
     # Load settings
     SETTINGS = load_mobile_bay_settings(data_dir)
     DATA_DIR = data_dir
+
+    # Build land mask for vector field filtering
+    LAND_MASK = build_land_mask(data_dir)
 
     print(f"✅ Server initialized with data from: {data_dir}")
 
