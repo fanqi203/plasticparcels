@@ -444,6 +444,7 @@ def get_vector_field():
         lon_min = float(request.args.get('lon_min', -88.6))
         lon_max = float(request.args.get('lon_max', -87.8))
         grid_density = int(request.args.get('grid_density', 15))
+        requested_depth = float(request.args.get('depth', 0.0))  # depth in meters (positive down)
         
         if not timestamp:
             return jsonify({"error": "timestamp parameter required"}), 400
@@ -651,15 +652,22 @@ def get_vector_field():
                 v_data = v_full
                 print("No time dimension found, using data as-is")
         
-        # If data has a depth dimension, select surface level (index 0)
+        # Select depth level closest to requested depth
+        depth_index = 0  # default: surface
+        selected_depth = 0.0
         for depth_dim in ['depthw', 'depthu', 'depthv', 'depth']:
             if depth_dim in u_data.dims:
-                u_data = u_data.isel({depth_dim: 0})
-                print(f"Selected surface level from depth dimension: {depth_dim}")
+                depth_values = u_data[depth_dim].values
+                # Find closest depth level (depths are positive: 0, 5, 10, 20, ...)
+                abs_requested = abs(requested_depth)  # handle negative depths too
+                depth_index = int(np.argmin(np.abs(depth_values - abs_requested)))
+                selected_depth = float(depth_values[depth_index])
+                u_data = u_data.isel({depth_dim: depth_index})
+                print(f"Requested depth: {requested_depth}m -> selected depth level {depth_index}: {selected_depth}m (dim: {depth_dim})")
                 break
         for depth_dim in ['depthw', 'depthu', 'depthv', 'depth']:
             if depth_dim in v_data.dims:
-                v_data = v_data.isel({depth_dim: 0})
+                v_data = v_data.isel({depth_dim: depth_index})
                 break
         
         print(f"u_data shape after time/depth selection: {u_data.shape}")
@@ -790,6 +798,7 @@ def get_vector_field():
             },
             "grid_density": grid_density,
             "data_source": "real",
+            "depth": selected_depth,
             "files_used": [u_file, v_file]
         }
         
