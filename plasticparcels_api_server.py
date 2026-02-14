@@ -867,6 +867,147 @@ def get_vector_field():
         print(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 
+
+@app.route('/wind-field', methods=['GET'])
+def get_wind_field():
+    """Get wind vector field data for a specific timestamp and bounding box."""
+    try:
+        import numpy as np
+        import pandas as pd
+        
+        # Get query parameters
+        timestamp = request.args.get('timestamp')
+        lat_min = float(request.args.get('lat_min', 24.0))
+        lat_max = float(request.args.get('lat_max', 34.0))
+        lon_min = float(request.args.get('lon_min', -93.0))
+        lon_max = float(request.args.get('lon_max', -71.0))
+        grid_density = int(request.args.get('grid_density', 15))
+        
+        if not timestamp:
+            return jsonify({"error": "timestamp parameter required"}), 400
+        
+        # Parse timestamp to find appropriate wind file
+        try:
+            if timestamp.endswith('Z'):
+                timestamp_clean = timestamp[:-1] + '+00:00'
+            else:
+                timestamp_clean = timestamp
+            try:
+                dt = datetime.fromisoformat(timestamp_clean)
+            except:
+                dt = pd.to_datetime(timestamp).to_pydatetime()
+            date_str = dt.strftime('%Y-%m-%d')
+        except Exception as e:
+            return jsonify({"error": f"Invalid timestamp: {e}"}), 400
+        
+        # Find wind file for the date
+        wind_dir = os.path.join(DATA_DIR, 'wind')
+        wind_file = os.path.join(wind_dir, f'Wind_{date_str}.nc')
+        
+        if not os.path.exists(wind_file):
+            # Try to find closest available wind file
+            available = sorted([f for f in os.listdir(wind_dir) if f.startswith('Wind_') and f.endswith('.nc')]) if os.path.isdir(wind_dir) else []
+            if available:
+                # Use the closest date
+                available_dates = [f.replace('Wind_', '').replace('.nc', '') for f in available]
+                closest_date = min(available_dates, key=lambda d: abs(pd.to_datetime(d) - pd.to_datetime(date_str)))
+                wind_file = os.path.join(wind_dir, f'Wind_{closest_date}.nc')
+                print(f"Wind file for {date_str} not found, using closest: {closest_date}")
+            else:
+                return jsonify({"error": f"No wind data available. Wind dir: {wind_dir}"}), 404
+        
+        # Load wind NetCDF
+        ds = xr.open_dataset(wind_file)
+        
+        # Find closest time step
+        time_index = 0
+        try:
+            requested_time = pd.to_datetime(timestamp.replace('Z', '+00:00'))
+            time_coords = pd.to_datetime(ds.time.values)
+            time_diffs = np.abs(time_coords - requested_time)
+            time_index = int(np.argmin(time_diffs))
+        except Exception as e:
+            print(f"Wind time parsing fallback: {e}")
+        
+        u10 = ds['u10'].isel(time=time_index).values  # shape: (lat, lon)
+        v10 = ds['v10'].isel(time=time_index).values
+        lats = ds['latitude'].values
+        lons = ds['longitude'].values
+        
+        ds.close()
+        
+        # Create meshgrid
+        lon_grid, lat_grid = np.meshgrid(lons, lats)
+        
+        # Filter to bounding box
+        lat_mask = (lat_grid >= lat_min) & (lat_grid <= lat_max)
+        lon_mask = (lon_grid >= lon_min) & (lon_grid <= lon_max)
+        bbox_mask = lat_mask & lon_mask
+        
+        # Subsample based on grid density
+        lat_range = lat_max - lat_min
+        lon_range = lon_max - lon_min
+        aspect_ratio = lon_range / lat_range if lat_range > 0 else 1.0
+        
+        grid_density_lat = grid_density
+        grid_density_lon = max(grid_density, int(grid_density * aspect_ratio))
+        
+        step_lat = max(1, lat_grid.shape[0] // grid_density_lat)
+        step_lon = max(1, lat_grid.shape[1] // grid_density_lon)
+        
+        lat_sub = lat_grid[::step_lat, ::step_lon]
+        lon_sub = lon_grid[::step_lat, ::step_lon]
+        mask_sub = bbox_mask[::step_lat, ::step_lon]
+        u_sub = u10[::step_lat, ::step_lon]
+        v_sub = v10[::step_lat, ::step_lon]
+        
+        # Build vectors list (skip land using precomputed mask)
+        vectors = []
+        for i in range(lat_sub.shape[0]):
+            for j in range(lat_sub.shape[1]):
+                if mask_sub[i, j] and not (np.isnan(u_sub[i, j]) or np.isnan(v_sub[i, j])):
+                    # Skip land points if land mask is available
+                    if LAND_MASK is not None:
+                        lm = LAND_MASK
+                        lat_val = float(lat_sub[i, j])
+                        lon_val = float(lon_sub[i, j])
+                        gi = int(round((lat_val - lm['lat_min']) / (lm['lat_max'] - lm['lat_min']) * (lm['ny'] - 1)))
+                        gj = int(round((lon_val - lm['lon_min']) / (lm['lon_max'] - lm['lon_min']) * (lm['nx'] - 1)))
+                        gi = max(0, min(gi, lm['ny'] - 1))
+                        gj = max(0, min(gj, lm['nx'] - 1))
+                        if lm['mask'][gi, gj]:
+                            continue
+                    
+                    u_val = float(u_sub[i, j])
+                    v_val = float(v_sub[i, j])
+                    magnitude = float(np.sqrt(u_val**2 + v_val**2))
+                    
+                    vectors.append({
+                        "lat": float(lat_sub[i, j]),
+                        "lng": float(lon_sub[i, j]),
+                        "u": u_val,
+                        "v": v_val,
+                        "magnitude": magnitude
+                    })
+        
+        print(f"Wind field: {len(vectors)} vectors for {date_str}, time_index={time_index}")
+        
+        return jsonify({
+            "timestamp": timestamp,
+            "vectors": vectors,
+            "bounds": {"lat_min": lat_min, "lat_max": lat_max, "lon_min": lon_min, "lon_max": lon_max},
+            "grid_density": grid_density,
+            "data_source": "real",
+            "files_used": [wind_file]
+        })
+        
+    except Exception as e:
+        import traceback
+        print(f"Error in get_wind_field: {e}")
+        print(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/info', methods=['GET'])
 def get_info():
     """Get information about the loaded dataset."""
