@@ -209,7 +209,7 @@ def zarr_to_geojson(zarr_file):
     except Exception as e:
         raise Exception(f"Error converting zarr to GeoJSON: {e}")
 
-def run_trajectory_simulation(release_locations, simulation_hours=72, output_minutes=30, dt_minutes=5, start_date=None, plastic_density=None, plastic_diameter=None):
+def run_trajectory_simulation(release_locations, simulation_hours=72, output_minutes=30, dt_minutes=5, start_date=None, plastic_density=None, plastic_diameter=None, wind_coefficient=None):
     """Run PlasticParcels simulation with given release locations."""
     try:
         # Import PlasticParcels
@@ -259,15 +259,53 @@ def run_trajectory_simulation(release_locations, simulation_hours=72, output_min
             'dt': timedelta(minutes=dt_minutes),
         }
 
+        # Determine wind coefficient
+        use_wind = wind_coefficient is not None and wind_coefficient > 0
+        actual_wind_coefficient = float(wind_coefficient) if use_wind else 0.0
+
         settings['plastictype'] = {
-            'wind_coefficient': 0.0,
+            'wind_coefficient': actual_wind_coefficient,
             'plastic_diameter': plastic_diameter if plastic_diameter is not None else 0.001,
             'plastic_density': plastic_density if plastic_density is not None else 1028.0,
         }
-        print(f"Plastic properties: diameter={settings['plastictype']['plastic_diameter']}m, density={settings['plastictype']['plastic_density']}kg/m3")
+        print(f"Plastic properties: diameter={settings['plastictype']['plastic_diameter']}m, density={settings['plastictype']['plastic_density']}kg/m3, wind_coeff={actual_wind_coefficient}")
 
         # Create fieldset
         fieldset = create_hydrodynamic_fieldset(settings)
+
+        # Load wind fields if wind coefficient > 0 (must be done BEFORE creating particleset)
+        wind_loaded = False
+        if use_wind:
+            wind_dir = os.path.join(DATA_DIR, 'wind')
+            wind_file = os.path.join(wind_dir, f'Wind_{start_date.strftime("%Y-%m-%d")}.nc')
+            print(f"Looking for wind file: {wind_file}")
+
+            if os.path.exists(wind_file):
+                try:
+                    from parcels import FieldSet as ParcelsFieldSet
+                    from parcels.tools.converters import Geographic, GeographicPolar
+
+                    filenames_wind = {'Wind_U': wind_file, 'Wind_V': wind_file}
+                    variables_wind = {'Wind_U': 'u10', 'Wind_V': 'v10'}
+                    dimensions_wind = {'lon': 'longitude', 'lat': 'latitude', 'time': 'time'}
+
+                    fieldset_wind = ParcelsFieldSet.from_netcdf(
+                        filenames_wind, variables_wind, dimensions_wind,
+                        mesh='spherical', allow_time_extrapolation=True
+                    )
+                    fieldset_wind.Wind_U.units = GeographicPolar()
+                    fieldset_wind.Wind_V.units = Geographic()
+
+                    fieldset.add_field(fieldset_wind.Wind_U)
+                    fieldset.add_field(fieldset_wind.Wind_V)
+
+                    wind_loaded = True
+                    print(f"Wind fields loaded from {wind_file}")
+                except Exception as e:
+                    print(f"WARNING: Failed to load wind fields: {e}")
+                    wind_loaded = False
+            else:
+                print(f"WARNING: Wind file not found: {wind_file}. Running without wind.")
 
         # Create particle set
         pset = create_particleset(fieldset, settings, release_locations)
@@ -284,6 +322,19 @@ def run_trajectory_simulation(release_locations, simulation_hours=72, output_min
             from plasticparcels.constructors import create_kernel
             kernels = create_kernel(fieldset)
             print(f"Running 3D simulation with full kernel chain (including SettlingVelocity)...")
+
+            # Add WindageDrift kernel if wind fields were loaded
+            if wind_loaded:
+                from plasticparcels.kernels import WindageDrift
+                # Insert WindageDrift after SettlingVelocity but before status-check kernels
+                # Find position after last physics kernel (before checkThroughBathymetry/periodicBC/deleteParticle)
+                insert_pos = len(kernels)
+                for i, k in enumerate(kernels):
+                    if hasattr(k, '__name__') and k.__name__ in ('checkThroughBathymetry', 'checkErrorThroughSurface', 'periodicBC', 'deleteParticle'):
+                        insert_pos = i
+                        break
+                kernels.insert(insert_pos, WindageDrift)
+                print(f"Added WindageDrift kernel (wind_coefficient={actual_wind_coefficient})")
         else:
             kernels = parcels.AdvectionRK4
             print(f"Running 2D simulation (horizontal advection only)...")
@@ -410,6 +461,11 @@ def simulate_trajectories():
         if plastic_diameter is not None:
             plastic_diameter = float(plastic_diameter)
 
+        # Get wind coefficient from request (optional)
+        wind_coefficient = data.get('wind_coefficient', 0.0)
+        if wind_coefficient is not None:
+            wind_coefficient = float(wind_coefficient)
+
         # Run simulation
         output_file = run_trajectory_simulation(
             release_locations,
@@ -418,7 +474,8 @@ def simulate_trajectories():
             dt_minutes,
             start_date,
             plastic_density,
-            plastic_diameter
+            plastic_diameter,
+            wind_coefficient
         )
 
         # Convert to GeoJSON
