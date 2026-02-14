@@ -209,7 +209,7 @@ def zarr_to_geojson(zarr_file):
     except Exception as e:
         raise Exception(f"Error converting zarr to GeoJSON: {e}")
 
-def run_trajectory_simulation(release_locations, simulation_hours=72, output_minutes=30, dt_minutes=5, start_date=None, plastic_density=None, plastic_diameter=None, wind_coefficient=None):
+def run_trajectory_simulation(release_locations, simulation_hours=72, output_minutes=30, dt_minutes=5, start_date=None, plastic_density=None, plastic_diameter=None, wind_coefficient=None, use_stokes=False):
     """Run PlasticParcels simulation with given release locations."""
     try:
         # Import PlasticParcels
@@ -307,6 +307,57 @@ def run_trajectory_simulation(release_locations, simulation_hours=72, output_min
             else:
                 print(f"WARNING: Wind file not found: {wind_file}. Running without wind.")
 
+
+        # Load Stokes drift fields if enabled (must be done BEFORE creating particleset)
+        # NOTE: We keep fieldset.use_stokes = False so create_kernel() doesn't add
+        # the unbeaching kernel (which requires unbeach_U/V fields we don't have).
+        # Instead, we manually insert the StokesDrift kernel after create_kernel().
+        stokes_loaded = False
+        if use_stokes:
+            wave_dir = os.path.join(DATA_DIR, 'waves')
+            wave_file = os.path.join(wave_dir, f'Waves_{start_date.strftime("%Y-%m-%d")}.nc')
+            print(f"Looking for wave file: {wave_file}")
+
+            if os.path.exists(wave_file):
+                try:
+                    from parcels import FieldSet as ParcelsFieldSet
+                    from parcels.tools.converters import Geographic, GeographicPolar
+
+                    filenames_stokes = {
+                        'Stokes_U': wave_file,
+                        'Stokes_V': wave_file,
+                        'wave_Tp': wave_file,
+                    }
+                    variables_stokes = {
+                        'Stokes_U': 'Stokes_U',
+                        'Stokes_V': 'Stokes_V',
+                        'wave_Tp': 'wave_Tp',
+                    }
+                    dimensions_stokes = {
+                        'lon': 'longitude',
+                        'lat': 'latitude',
+                        'time': 'time',
+                    }
+
+                    fieldset_stokes = ParcelsFieldSet.from_netcdf(
+                        filenames_stokes, variables_stokes, dimensions_stokes,
+                        mesh='spherical', allow_time_extrapolation=True
+                    )
+                    fieldset_stokes.Stokes_U.units = GeographicPolar()
+                    fieldset_stokes.Stokes_V.units = Geographic()
+
+                    fieldset.add_field(fieldset_stokes.Stokes_U)
+                    fieldset.add_field(fieldset_stokes.Stokes_V)
+                    fieldset.add_field(fieldset_stokes.wave_Tp)
+
+                    stokes_loaded = True
+                    print(f"Stokes drift fields loaded from {wave_file}")
+                except Exception as e:
+                    print(f"WARNING: Failed to load Stokes drift fields: {e}")
+                    stokes_loaded = False
+            else:
+                print(f"WARNING: Wave file not found: {wave_file}. Running without Stokes drift.")
+
         # Create particle set
         pset = create_particleset(fieldset, settings, release_locations)
 
@@ -335,6 +386,31 @@ def run_trajectory_simulation(release_locations, simulation_hours=72, output_min
                         break
                 kernels.insert(insert_pos, WindageDrift)
                 print(f"Added WindageDrift kernel (wind_coefficient={actual_wind_coefficient})")
+
+            # Add StokesDrift kernel if Stokes fields were loaded
+            if stokes_loaded:
+                from plasticparcels.kernels import StokesDrift
+                insert_pos = len(kernels)
+                for i, k in enumerate(kernels):
+                    if hasattr(k, '__name__') and k.__name__ in ('checkThroughBathymetry', 'checkErrorThroughSurface', 'periodicBC', 'deleteParticle'):
+                        insert_pos = i
+                        break
+                kernels.insert(insert_pos, StokesDrift)
+                print(f"Added StokesDrift kernel")
+
+            # Add unbeaching kernel if wind or Stokes drift is active
+            # Uses unbeachingBySamplingAfterwards which requires no special fields -
+            # it samples velocity in cardinal directions to find the ocean direction
+            if wind_loaded or stokes_loaded:
+                from plasticparcels.kernels import unbeachingBySamplingAfterwards
+                insert_pos = len(kernels)
+                for i, k in enumerate(kernels):
+                    if hasattr(k, '__name__') and k.__name__ in ('checkThroughBathymetry', 'checkErrorThroughSurface', 'periodicBC', 'deleteParticle'):
+                        insert_pos = i
+                        break
+                kernels.insert(insert_pos, unbeachingBySamplingAfterwards)
+                print(f"Added unbeachingBySamplingAfterwards kernel")
+
         else:
             kernels = parcels.AdvectionRK4
             print(f"Running 2D simulation (horizontal advection only)...")
@@ -466,6 +542,10 @@ def simulate_trajectories():
         if wind_coefficient is not None:
             wind_coefficient = float(wind_coefficient)
 
+        # Get Stokes drift toggle from request (optional)
+        use_stokes = data.get('use_stokes', False)
+        use_stokes = bool(use_stokes)
+
         # Run simulation
         output_file = run_trajectory_simulation(
             release_locations,
@@ -475,7 +555,8 @@ def simulate_trajectories():
             start_date,
             plastic_density,
             plastic_diameter,
-            wind_coefficient
+            wind_coefficient,
+            use_stokes
         )
 
         # Convert to GeoJSON
