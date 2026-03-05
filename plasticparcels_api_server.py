@@ -16,6 +16,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import numpy as np
 import xarray as xr
+import pandas as pd
 
 # Add current directory to path for imports
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -506,28 +507,15 @@ def get_vector_field():
         if not timestamp:
             return jsonify({"error": "timestamp parameter required"}), 400
             
-        # Parse timestamp to find appropriate NetCDF files
+        # Parse timestamp once and normalize to UTC for robust matching
         try:
-            import pandas as pd
-            # More robust timestamp parsing
-            if timestamp.endswith('Z'):
-                timestamp_clean = timestamp[:-1] + '+00:00'
-            else:
-                timestamp_clean = timestamp
-            
-            # Try multiple parsing methods
-            try:
-                dt = datetime.fromisoformat(timestamp_clean)
-            except:
-                dt = pd.to_datetime(timestamp).to_pydatetime()
-            
-            date_str = dt.strftime('%Y-%m-%d')
-            print(f"Parsed timestamp {timestamp} -> date {date_str}")
+            requested_time_utc = pd.to_datetime(timestamp, utc=True)
+            # Use timezone-naive datetime only where date strings are needed
+            dt = requested_time_utc.tz_localize(None).to_pydatetime()
+            date_str = requested_time_utc.strftime('%Y-%m-%d')
+            print(f"Parsed timestamp {timestamp} -> {requested_time_utc.isoformat()} (date {date_str})")
         except Exception as e:
-            print(f"Timestamp parsing error: {e}")
-            # Fallback to a default date if parsing fails
-            date_str = '2024-01-01'
-            print(f"Using fallback date: {date_str}")
+            return jsonify({"error": f"Invalid timestamp format: {timestamp} ({e})"}), 400
             
         # Find U and V files for the date
         u_file = os.path.join(DATA_DIR, f'U_{date_str}.nc')
@@ -631,47 +619,27 @@ def get_vector_field():
             print(f"Available time steps: {len(time_coords)}")
             print(f"Time range: {time_coords[0]} to {time_coords[-1]}")
             
-            # Parse the requested timestamp - simplified approach
+            # Parse and match timestamps in UTC to avoid tz-aware/naive mismatch
             try:
-                import numpy as np
-                from datetime import datetime
-                import pandas as pd
-                
-                print(f"Raw timestamp received: {timestamp}")
-                
-                # Parse the requested timestamp
-                if timestamp.endswith('Z'):
-                    timestamp = timestamp[:-1] + '+00:00'
-                
-                requested_time = pd.to_datetime(timestamp)
-                print(f"Parsed requested time: {requested_time}")
-                
-                # Convert time coordinates to pandas datetime for easier comparison
-                time_coords_pd = pd.to_datetime(time_coords)
-                print(f"Time coords range: {time_coords_pd[0]} to {time_coords_pd[-1]}")
-                
-                # Find the closest time index
-                time_diffs = np.abs(time_coords_pd - requested_time)
+                print(f"Requested UTC time: {requested_time_utc.isoformat()}")
+
+                # Convert model timestamps to UTC-aware values
+                time_coords_pd = pd.to_datetime(time_coords, utc=True)
+                print(f"Time coords range (UTC): {time_coords_pd[0]} to {time_coords_pd[-1]}")
+
+                # Find closest available model time step
+                time_diffs = np.abs(time_coords_pd - requested_time_utc)
                 time_index = int(np.argmin(time_diffs))
-                
+
                 closest_time = time_coords_pd[time_index]
-                print(f"Using time index {time_index}: {closest_time}")
-                
+                print(f"Using time index {time_index}: {closest_time} (UTC)")
             except Exception as e:
-                print(f"Error parsing timestamp: {e}")
+                print(f"Error matching requested timestamp to model times: {e}")
                 print(f"Timestamp type: {type(timestamp)}")
                 print(f"Time coords type: {type(time_coords)}")
                 print(f"Time coords sample: {time_coords[:3] if len(time_coords) > 0 else 'empty'}")
-                # For now, use a simple hour-based approach as fallback
-                try:
-                    # Extract hour from timestamp and use modulo for cycling
-                    hour_match = timestamp.split('T')[1].split(':')[0] if 'T' in timestamp else '0'
-                    hour = int(hour_match) % len(time_coords)
-                    time_index = hour
-                    print(f"Fallback: using hour-based index {time_index}")
-                except:
-                    time_index = 0
-                    print("Using first time step as final fallback")
+                time_index = 0
+                print("Fallback: using first time step")
             
             u_data = u_full.isel(time_counter=time_index)
             v_data = v_full.isel(time_counter=time_index)
@@ -680,14 +648,11 @@ def get_vector_field():
             # Similar logic for 'time' dimension
             time_coords = u_full.time.values
             try:
-                from datetime import datetime
-                import numpy as np
-                
-                requested_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-                requested_np_time = np.datetime64(requested_time)
-                time_diffs = np.abs(time_coords - requested_np_time)
+                time_coords_pd = pd.to_datetime(time_coords, utc=True)
+                time_diffs = np.abs(time_coords_pd - requested_time_utc)
                 time_index = int(np.argmin(time_diffs))
-                print(f"Using time index {time_index} from 'time' dimension")
+                closest_time = time_coords_pd[time_index]
+                print(f"Using time index {time_index} from 'time' dimension: {closest_time} (UTC)")
             except Exception as e:
                 print(f"Error parsing timestamp for 'time' dimension: {e}")
                 time_index = 0
