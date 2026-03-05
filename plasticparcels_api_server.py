@@ -260,9 +260,8 @@ def run_trajectory_simulation(release_locations, simulation_hours=72, output_min
             'dt': timedelta(minutes=dt_minutes),
         }
 
-        # Determine wind coefficient
-        use_wind = wind_coefficient is not None and wind_coefficient > 0
-        actual_wind_coefficient = float(wind_coefficient) if use_wind else 0.0
+        # Determine wind coefficient (used by WindageDrift kernel magnitude)
+        actual_wind_coefficient = float(wind_coefficient) if wind_coefficient is not None else 0.0
 
         settings['plastictype'] = {
             'wind_coefficient': actual_wind_coefficient,
@@ -274,39 +273,72 @@ def run_trajectory_simulation(release_locations, simulation_hours=72, output_min
         # Create fieldset
         fieldset = create_hydrodynamic_fieldset(settings)
 
-        # Load wind fields if wind coefficient > 0 (must be done BEFORE creating particleset)
+        # Load optional wind/wave fields (must be done BEFORE creating particleset)
         wind_loaded = False
-        if use_wind:
-            wind_dir = os.path.join(DATA_DIR, 'wind')
-            wind_file = os.path.join(wind_dir, f'Wind_{start_date.strftime("%Y-%m-%d")}.nc')
-            print(f"Looking for wind file: {wind_file}")
+        stokes_loaded = False
 
-            if os.path.exists(wind_file):
-                try:
-                    from parcels import FieldSet as ParcelsFieldSet
-                    from parcels.tools.converters import Geographic, GeographicPolar
+        wind_dir = os.path.join(DATA_DIR, 'wind')
+        wind_file = os.path.join(wind_dir, f'Wind_{start_date.strftime("%Y-%m-%d")}.nc')
+        print(f"Looking for wind file: {wind_file}")
 
-                    filenames_wind = {'Wind_U': wind_file, 'Wind_V': wind_file}
-                    variables_wind = {'Wind_U': 'u10', 'Wind_V': 'v10'}
-                    dimensions_wind = {'lon': 'longitude', 'lat': 'latitude', 'time': 'time'}
+        if os.path.exists(wind_file):
+            try:
+                from parcels import FieldSet as ParcelsFieldSet
+                from parcels.tools.converters import Geographic, GeographicPolar
 
-                    fieldset_wind = ParcelsFieldSet.from_netcdf(
-                        filenames_wind, variables_wind, dimensions_wind,
-                        mesh='spherical', allow_time_extrapolation=True
-                    )
-                    fieldset_wind.Wind_U.units = GeographicPolar()
-                    fieldset_wind.Wind_V.units = Geographic()
+                filenames_wind = {'Wind_U': wind_file, 'Wind_V': wind_file}
+                variables_wind = {'Wind_U': 'u10', 'Wind_V': 'v10'}
+                dimensions_wind = {'lon': 'longitude', 'lat': 'latitude', 'time': 'time'}
 
-                    fieldset.add_field(fieldset_wind.Wind_U)
-                    fieldset.add_field(fieldset_wind.Wind_V)
+                fieldset_wind = ParcelsFieldSet.from_netcdf(
+                    filenames_wind, variables_wind, dimensions_wind,
+                    mesh='spherical', allow_time_extrapolation=True
+                )
+                fieldset_wind.Wind_U.units = GeographicPolar()
+                fieldset_wind.Wind_V.units = Geographic()
 
-                    wind_loaded = True
-                    print(f"Wind fields loaded from {wind_file}")
-                except Exception as e:
-                    print(f"WARNING: Failed to load wind fields: {e}")
-                    wind_loaded = False
-            else:
-                print(f"WARNING: Wind file not found: {wind_file}. Running without wind.")
+                fieldset.add_field(fieldset_wind.Wind_U)
+                fieldset.add_field(fieldset_wind.Wind_V)
+
+                wind_loaded = True
+                print(f"Wind fields loaded from {wind_file}")
+            except Exception as e:
+                print(f"WARNING: Failed to load wind fields: {e}")
+                wind_loaded = False
+        else:
+            print(f"WARNING: Wind file not found: {wind_file}. Running without wind.")
+
+        # Stokes is enabled whenever a matching waves file exists for the start date.
+        waves_dir = os.path.join(DATA_DIR, 'waves')
+        waves_file = os.path.join(waves_dir, f'Waves_{start_date.strftime("%Y-%m-%d")}.nc')
+        print(f"Looking for waves file: {waves_file}")
+        if os.path.exists(waves_file):
+            try:
+                from parcels import FieldSet as ParcelsFieldSet
+                from parcels.tools.converters import Geographic, GeographicPolar
+
+                filenames_stokes = {'Stokes_U': waves_file, 'Stokes_V': waves_file, 'wave_Tp': waves_file}
+                variables_stokes = {'Stokes_U': 'Stokes_U', 'Stokes_V': 'Stokes_V', 'wave_Tp': 'wave_Tp'}
+                dimensions_stokes = {'lon': 'longitude', 'lat': 'latitude', 'time': 'time'}
+
+                fieldset_stokes = ParcelsFieldSet.from_netcdf(
+                    filenames_stokes, variables_stokes, dimensions_stokes,
+                    mesh='spherical', allow_time_extrapolation=True
+                )
+                fieldset_stokes.Stokes_U.units = GeographicPolar()
+                fieldset_stokes.Stokes_V.units = Geographic()
+
+                fieldset.add_field(fieldset_stokes.Stokes_U)
+                fieldset.add_field(fieldset_stokes.Stokes_V)
+                fieldset.add_field(fieldset_stokes.wave_Tp)
+
+                stokes_loaded = True
+                print(f"Stokes fields loaded from {waves_file}")
+            except Exception as e:
+                print(f"WARNING: Failed to load Stokes fields: {e}")
+                stokes_loaded = False
+        else:
+            print(f"WARNING: Waves file not found: {waves_file}. Running without Stokes drift.")
 
         # Create particle set
         pset = create_particleset(fieldset, settings, release_locations)
@@ -324,17 +356,32 @@ def run_trajectory_simulation(release_locations, simulation_hours=72, output_min
             kernels = create_kernel(fieldset)
             print(f"Running 3D simulation with full kernel chain (including SettlingVelocity)...")
 
-            # Add WindageDrift kernel if wind fields were loaded
-            if wind_loaded:
-                from plasticparcels.kernels import WindageDrift
-                # Insert WindageDrift after SettlingVelocity but before status-check kernels
-                # Find position after last physics kernel (before checkThroughBathymetry/periodicBC/deleteParticle)
+            def _kernel_name(kernel_obj):
+                name = getattr(kernel_obj, '__name__', None)
+                if name:
+                    return name
+                pyfunc = getattr(kernel_obj, 'pyfunc', None)
+                return getattr(pyfunc, '__name__', None)
+
+            def _has_kernel(name):
+                return any(_kernel_name(k) == name for k in kernels)
+
+            def _insert_before_status_checks(kernel_fn):
                 insert_pos = len(kernels)
                 for i, k in enumerate(kernels):
-                    if hasattr(k, '__name__') and k.__name__ in ('checkThroughBathymetry', 'checkErrorThroughSurface', 'periodicBC', 'deleteParticle'):
+                    if _kernel_name(k) in ('checkThroughBathymetry', 'checkErrorThroughSurface', 'periodicBC', 'deleteParticle'):
                         insert_pos = i
                         break
-                kernels.insert(insert_pos, WindageDrift)
+                kernels.insert(insert_pos, kernel_fn)
+
+            if stokes_loaded and not _has_kernel('StokesDrift'):
+                from plasticparcels.kernels import StokesDrift
+                _insert_before_status_checks(StokesDrift)
+                print("Added StokesDrift kernel")
+
+            if wind_loaded and not _has_kernel('WindageDrift'):
+                from plasticparcels.kernels import WindageDrift
+                _insert_before_status_checks(WindageDrift)
                 print(f"Added WindageDrift kernel (wind_coefficient={actual_wind_coefficient})")
         else:
             kernels = parcels.AdvectionRK4
