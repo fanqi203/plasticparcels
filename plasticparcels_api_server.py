@@ -12,6 +12,7 @@ import json
 import tempfile
 import shutil
 from datetime import datetime, timedelta
+import threading
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import numpy as np
@@ -33,6 +34,7 @@ CORS(app,
 DATA_DIR = None
 SETTINGS = None
 LAND_MASK = None  # 2D boolean array: True = land, False = ocean
+SIM_LOCK = threading.Lock()  # Serialize simulations to prevent HDF5 concurrency issues
 
 def build_land_mask(data_dir):
     """Build a 2D land mask for the data grid using Natural Earth coastline."""
@@ -210,7 +212,26 @@ def zarr_to_geojson(zarr_file):
     except Exception as e:
         raise Exception(f"Error converting zarr to GeoJSON: {e}")
 
-def run_trajectory_simulation(release_locations, simulation_hours=72, output_minutes=30, dt_minutes=5, start_date=None, plastic_density=None, plastic_diameter=None, wind_coefficient=None):
+def SurfaceWindageDrift(particle, fieldset, time):
+    """Custom windage kernel without the depth-restriction from the stock WindageDrift.
+
+    The built-in WindageDrift only fires when particle.depth < 0.5*plastic_diameter
+    (i.e. < 0.5 mm for 1-mm particles), which is never satisfied in 3-D sigma-level
+    grids where even the surface layer centre sits at ~0.5 m depth.
+
+    This kernel applies leeway to ALL particles, making it suitable for sigma-
+    coordinate ocean models such as STOFS-3D / SCHISM.
+    NOTE: Do not use 'import' statements inside Parcels kernels - they are transpiled to C.
+    """
+    (ocean_U, ocean_V) = fieldset.UV[particle]
+    wind_U = fieldset.Wind_U[time, particle.depth, particle.lat, particle.lon]
+    wind_V = fieldset.Wind_V[time, particle.depth, particle.lat, particle.lon]
+    # Leeway: u_eff = u_ocean + C_w * (u_wind - u_ocean)
+    particle_dlon += particle.wind_coefficient * (wind_U - ocean_U) * particle.dt  # noqa
+    particle_dlat += particle.wind_coefficient * (wind_V - ocean_V) * particle.dt  # noqa
+
+
+def run_trajectory_simulation(release_locations, simulation_hours=72, output_minutes=30, dt_minutes=5, start_date=None, plastic_density=None, plastic_diameter=None, wind_coefficient=None, use_biofouling=False, use_stokes=True):
     """Run PlasticParcels simulation with given release locations."""
     try:
         # Import PlasticParcels
@@ -228,6 +249,9 @@ def run_trajectory_simulation(release_locations, simulation_hours=72, output_min
             if not os.path.isabs(ocean_dir):
                 # If it's relative, make it relative to DATA_DIR
                 settings['ocean']['directory'] = os.path.join(DATA_DIR, '')
+
+        # Apply use_biofouling flag (must be in settings before create_hydrodynamic_fieldset)
+        settings['use_biofouling'] = bool(use_biofouling)
 
         # Add simulation settings
         # Use provided start_date or determine from available data
@@ -308,11 +332,14 @@ def run_trajectory_simulation(release_locations, simulation_hours=72, output_min
         else:
             print(f"WARNING: Wind file not found: {wind_file}. Running without wind.")
 
-        # Stokes is enabled whenever a matching waves file exists for the start date.
+        # Stokes is enabled when use_stokes=True AND a matching waves file exists.
         waves_dir = os.path.join(DATA_DIR, 'waves')
         waves_file = os.path.join(waves_dir, f'Waves_{start_date.strftime("%Y-%m-%d")}.nc')
-        print(f"Looking for waves file: {waves_file}")
-        if os.path.exists(waves_file):
+        if use_stokes:
+            print(f"Looking for waves file: {waves_file}")
+        else:
+            print("Stokes drift disabled by use_stokes=False.")
+        if use_stokes and os.path.exists(waves_file):
             try:
                 from parcels import FieldSet as ParcelsFieldSet
                 from parcels.tools.converters import Geographic, GeographicPolar
@@ -339,6 +366,80 @@ def run_trajectory_simulation(release_locations, simulation_hours=72, output_min
                 stokes_loaded = False
         else:
             print(f"WARNING: Waves file not found: {waves_file}. Running without Stokes drift.")
+
+        # ── BGC fields for biofouling ──────────────────────────────────────────
+        if use_biofouling:
+            bgc_dir = os.path.join(DATA_DIR, 'bgc')
+            bgc_file = os.path.join(bgc_dir, f'BGC_{start_date.strftime("%Y-%m-%d")}.nc')
+
+            # Fallback: find the closest available BGC file
+            if not os.path.exists(bgc_file) and os.path.isdir(bgc_dir):
+                available_bgc = sorted([
+                    f for f in os.listdir(bgc_dir) if f.startswith('BGC_') and f.endswith('.nc')
+                ])
+                if available_bgc:
+                    bgc_file = os.path.join(bgc_dir, available_bgc[-1])
+                    print(f"BGC file for {start_date.date()} not found; using {available_bgc[-1]}")
+
+            if os.path.exists(bgc_file):
+                # ── Pre-validate BGC file to avoid segfault in C netCDF/HDF5 layer ──
+                # ParcelsField.from_netcdf segfaults on malformed/stub files; always
+                # check with netCDF4 first before handing off to Parcels.
+                _required_bgc_vars = ('nppv', 'phy', 'phy2')
+                _bgc_valid = False
+                try:
+                    import netCDF4 as _nc4
+                    with _nc4.Dataset(bgc_file) as _ds:
+                        _file_vars = set(_ds.variables.keys())
+                        _missing = [v for v in _required_bgc_vars if v not in _file_vars]
+                        if _missing:
+                            print(f"WARNING: BGC file missing required variables {_missing}. "
+                                  "Biofouling disabled for this run.")
+                        else:
+                            _bgc_valid = True
+                except Exception as _e:
+                    print(f"WARNING: Could not validate BGC file: {_e}. "
+                          "Biofouling disabled for this run.")
+
+                if _bgc_valid:
+                    try:
+                        from parcels import Field as ParcelsField
+                        bgc_dims = {'lon': 'longitude', 'lat': 'latitude',
+                                    'depth': 'depth', 'time': 'time'}
+
+                        pp_phyto = ParcelsField.from_netcdf(
+                            bgc_file, ('pp_phyto', 'nppv'), bgc_dims,
+                            mesh='spherical', allow_time_extrapolation=True)
+                        bio_nanophy = ParcelsField.from_netcdf(
+                            bgc_file, ('bio_nanophy', 'phy'), bgc_dims,
+                            mesh='spherical', allow_time_extrapolation=True)
+                        bio_diatom = ParcelsField.from_netcdf(
+                            bgc_file, ('bio_diatom', 'phy2'), bgc_dims,
+                            mesh='spherical', allow_time_extrapolation=True)
+
+                        fieldset.add_field(pp_phyto)
+                        fieldset.add_field(bio_nanophy)
+                        fieldset.add_field(bio_diatom)
+
+                        # Add BGC constants from settings
+                        bgc_constants = settings.get('bgc', {}).get('constants', {})
+                        for key, val in bgc_constants.items():
+                            fieldset.add_constant(key, val)
+
+                        print(f"✅ BGC fields loaded from {bgc_file}")
+                    except Exception as e:
+                        print(f"WARNING: Failed to load BGC fields: {e}. "
+                              "Biofouling disabled for this run.")
+                        settings['use_biofouling'] = False
+                        fieldset.use_biofouling = 0
+                else:
+                    settings['use_biofouling'] = False
+                    fieldset.use_biofouling = 0
+            else:
+                print(f"WARNING: BGC file not found: {bgc_file}. "
+                      "Biofouling disabled for this run.")
+                settings['use_biofouling'] = False
+                fieldset.use_biofouling = 0
 
         # Create particle set
         pset = create_particleset(fieldset, settings, release_locations)
@@ -379,10 +480,9 @@ def run_trajectory_simulation(release_locations, simulation_hours=72, output_min
                 _insert_before_status_checks(StokesDrift)
                 print("Added StokesDrift kernel")
 
-            if wind_loaded and not _has_kernel('WindageDrift'):
-                from plasticparcels.kernels import WindageDrift
-                _insert_before_status_checks(WindageDrift)
-                print(f"Added WindageDrift kernel (wind_coefficient={actual_wind_coefficient})")
+            if wind_loaded and actual_wind_coefficient > 0 and not _has_kernel('SurfaceWindageDrift'):
+                _insert_before_status_checks(SurfaceWindageDrift)
+                print(f"Added SurfaceWindageDrift kernel (wind_coefficient={actual_wind_coefficient})")
         else:
             kernels = parcels.AdvectionRK4
             print(f"Running 2D simulation (horizontal advection only)...")
@@ -440,7 +540,8 @@ def simulate_trajectories():
         "simulation_hours": 72 (optional, default 72),
         "output_minutes": 30 (optional, default 30),
         "dt_minutes": 5 (optional, default 5),
-        "start_date": "2025-10-13T00:00:00Z" (optional, auto-detected if not provided)
+        "start_date": "2025-10-13T00:00:00Z" (optional, auto-detected if not provided),
+        "use_biofouling": false (optional, default false — enables algal biofouling settling)
     }
 
     Returns GeoJSON FeatureCollection with trajectory LineStrings.
@@ -514,8 +615,15 @@ def simulate_trajectories():
         if wind_coefficient is not None:
             wind_coefficient = float(wind_coefficient)
 
-        # Run simulation
-        output_file = run_trajectory_simulation(
+        # Get biofouling flag from request (optional, default False)
+        use_biofouling = bool(data.get('use_biofouling', False))
+
+        # Get Stokes drift flag from request (optional, default True)
+        use_stokes = bool(data.get('use_stokes', True))
+
+        # Run simulation (serialized to avoid HDF5 thread conflicts)
+        with SIM_LOCK:
+            output_file = run_trajectory_simulation(
             release_locations,
             simulation_hours,
             output_minutes,
@@ -523,7 +631,9 @@ def simulate_trajectories():
             start_date,
             plastic_density,
             plastic_diameter,
-            wind_coefficient
+            wind_coefficient,
+            use_biofouling,
+            use_stokes,
         )
 
         # Convert to GeoJSON
