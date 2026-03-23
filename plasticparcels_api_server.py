@@ -682,8 +682,14 @@ def simulate_trajectories():
                 "capabilities": capabilities
             }), 400
 
-        # Run simulation (serialized to avoid HDF5 thread conflicts)
-        with SIM_LOCK:
+        # Run simulation (serialized to avoid HDF5 thread conflicts).
+        # Non-blocking acquire: if another simulation is already running, return
+        # 429 immediately instead of queuing and doubling peak memory usage.
+        if not SIM_LOCK.acquire(blocking=False):
+            return jsonify({
+                "error": "A simulation is already running. Please wait a few seconds and try again."
+            }), 429
+        try:
             output_file = run_trajectory_simulation(
             release_locations,
             simulation_hours,
@@ -696,6 +702,8 @@ def simulate_trajectories():
             use_biofouling,
             use_stokes,
         )
+        finally:
+            SIM_LOCK.release()
 
         # Convert to GeoJSON
         geojson = zarr_to_geojson(output_file)
