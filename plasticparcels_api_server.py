@@ -36,6 +36,48 @@ SETTINGS = None
 LAND_MASK = None  # 2D boolean array: True = land, False = ocean
 SIM_LOCK = threading.Lock()  # Serialize simulations to prevent HDF5 concurrency issues
 
+
+def parse_bool(value, default=False):
+    """Parse booleans from JSON-friendly values."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "t", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "f", "no", "n", "off", ""}:
+            return False
+        raise ValueError(f"Invalid boolean value: {value!r}")
+    return bool(value)
+
+
+def has_data_files(subdir, prefix):
+    """Return True when a data subdirectory contains matching NetCDF files."""
+    if not DATA_DIR:
+        return False
+    target_dir = os.path.join(DATA_DIR, subdir)
+    if not os.path.isdir(target_dir):
+        return False
+    return any(name.startswith(prefix) and name.endswith('.nc') for name in os.listdir(target_dir))
+
+
+def get_simulation_capabilities():
+    """Describe which optional simulation features are currently available."""
+    use_3d = bool(SETTINGS and SETTINGS.get('use_3D', False))
+    supports_wind = has_data_files('wind', 'Wind_')
+    supports_stokes = has_data_files('waves', 'Waves_')
+    supports_biofouling = use_3d and has_data_files('bgc', 'BGC_')
+    return {
+        "use_3d": use_3d,
+        "supports_wind": supports_wind,
+        "supports_stokes": supports_stokes,
+        "supports_biofouling": supports_biofouling,
+    }
+
 def build_land_mask(data_dir):
     """Build a 2D land mask for the data grid using Natural Earth coastline."""
     try:
@@ -484,8 +526,18 @@ def run_trajectory_simulation(release_locations, simulation_hours=72, output_min
                 _insert_before_status_checks(SurfaceWindageDrift)
                 print(f"Added SurfaceWindageDrift kernel (wind_coefficient={actual_wind_coefficient})")
         else:
-            kernels = parcels.AdvectionRK4
-            print(f"Running 2D simulation (horizontal advection only)...")
+            from plasticparcels.kernels import StokesDrift, periodicBC, deleteParticle
+
+            kernels = [parcels.AdvectionRK4]
+            if stokes_loaded:
+                kernels.append(StokesDrift)
+                print("Added StokesDrift kernel to 2D simulation")
+            if wind_loaded and actual_wind_coefficient > 0:
+                kernels.append(SurfaceWindageDrift)
+                print(f"Added SurfaceWindageDrift kernel to 2D simulation (wind_coefficient={actual_wind_coefficient})")
+            kernels.append(periodicBC)
+            kernels.append(deleteParticle)
+            print(f"Running 2D simulation with optional surface forcing...")
 
         # Run simulation
         pset.execute(
@@ -572,6 +624,8 @@ def simulate_trajectories():
         if 'plastic_amount' not in release_locations:
             release_locations['plastic_amount'] = [1.0] * len(lons)
 
+        capabilities = get_simulation_capabilities()
+
         # Get simulation parameters
         simulation_hours = data.get('simulation_hours', 72)
         output_minutes = data.get('output_minutes', 30)
@@ -616,10 +670,17 @@ def simulate_trajectories():
             wind_coefficient = float(wind_coefficient)
 
         # Get biofouling flag from request (optional, default False)
-        use_biofouling = bool(data.get('use_biofouling', False))
+        try:
+            use_biofouling = parse_bool(data.get('use_biofouling'), default=False)
+            use_stokes = parse_bool(data.get('use_stokes'), default=True)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
 
-        # Get Stokes drift flag from request (optional, default True)
-        use_stokes = bool(data.get('use_stokes', True))
+        if use_biofouling and not capabilities['supports_biofouling']:
+            return jsonify({
+                "error": "Biofouling is not available for the current dataset configuration",
+                "capabilities": capabilities
+            }), 400
 
         # Run simulation (serialized to avoid HDF5 thread conflicts)
         with SIM_LOCK:
@@ -1044,8 +1105,8 @@ def get_wind_field():
         # Find closest time step
         time_index = 0
         try:
-            requested_time = pd.to_datetime(timestamp.replace('Z', '+00:00'))
-            time_coords = pd.to_datetime(ds.time.values)
+            requested_time = pd.to_datetime(timestamp, utc=True)
+            time_coords = pd.to_datetime(ds.time.values, utc=True)
             time_diffs = np.abs(time_coords - requested_time)
             time_index = int(np.argmin(time_diffs))
         except Exception as e:
@@ -1172,7 +1233,8 @@ def get_info():
                 "start": float(fieldset.U.grid.time[0]),
                 "end": float(fieldset.U.grid.time[-1])
             },
-            "data_directory": DATA_DIR
+            "data_directory": DATA_DIR,
+            "capabilities": get_simulation_capabilities()
         }
 
         return jsonify(info)
@@ -1215,7 +1277,8 @@ def get_data_range():
             "start_date": start_date,
             "end_date": end_date,
             "total_days": len(available_dates),
-            "available_dates": available_dates
+            "available_dates": available_dates,
+            "capabilities": get_simulation_capabilities()
         })
 
     except Exception as e:
