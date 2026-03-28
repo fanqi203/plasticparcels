@@ -59,6 +59,13 @@ def create_hydrodynamic_fieldset(settings):
     fieldset = FieldSet.from_nemo(filenames, variables, dimensions,
                                   indices=indices, allow_time_extrapolation=settings['allow_time_extrapolation'])
 
+    # STOFS-3D data is on a regular A-grid (all variables at identical nav_lon/nav_lat points).
+    # from_nemo() assumes a NEMO C-grid and sets interp_method='cgrid_velocity' for U/V,
+    # which averages across cell faces and produces wrong velocities.  Override to 'linear'.
+    for field_name in ['U', 'V', 'W']:
+        if hasattr(fieldset, field_name):
+            getattr(fieldset, field_name).interp_method = 'linear'
+
     # Create flags for custom particle behaviour
     fieldset.add_constant('use_mixing', settings['use_mixing'])
     fieldset.add_constant('use_biofouling', settings['use_biofouling'])
@@ -251,10 +258,17 @@ def create_particleset(fieldset, settings, release_locations):
     for variable in variables:
         setattr(PlasticParticle, variable.name, variable)
 
+    # Initialize particles at the simulation startdate so Parcels samples the
+    # correct time slice. Without this, particles default to t=0 (FieldSet time
+    # origin), which is usually the first day of data — not the actual run date.
+    startdate = settings['simulation']['startdate']
+    particle_times = [startdate] * len(lons)
+
     pset = ParticleSet.from_list(fieldset,
                                  PlasticParticle,
                                  lon=lons,
                                  lat=lats,
+                                 time=particle_times,
                                  plastic_diameter=plastic_diameters,
                                  plastic_density=plastic_densities,
                                  wind_coefficient=wind_coefficients,

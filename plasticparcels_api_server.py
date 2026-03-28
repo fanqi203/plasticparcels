@@ -6,16 +6,19 @@ A Flask server that accepts plastic release locations and generates
 trajectories in GeoJSON format using PlasticParcels.
 """
 
+import gc
 import os
 import sys
 import json
 import tempfile
 import shutil
 from datetime import datetime, timedelta
+import threading
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import numpy as np
 import xarray as xr
+import pandas as pd
 
 # Add current directory to path for imports
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -32,6 +35,51 @@ CORS(app,
 DATA_DIR = None
 SETTINGS = None
 LAND_MASK = None  # 2D boolean array: True = land, False = ocean
+SIM_LOCK = threading.Lock()  # Serialize simulations to prevent HDF5 concurrency issues
+VF_LOCK = threading.Lock()   # Serialize /vector-field to prevent concurrent NC opens
+VECTOR_CACHE = {}            # {date_str: {u, v, lats, lons, times}} — preloaded numpy arrays
+
+
+def parse_bool(value, default=False):
+    """Parse booleans from JSON-friendly values."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "t", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "f", "no", "n", "off", ""}:
+            return False
+        raise ValueError(f"Invalid boolean value: {value!r}")
+    return bool(value)
+
+
+def has_data_files(subdir, prefix):
+    """Return True when a data subdirectory contains matching NetCDF files."""
+    if not DATA_DIR:
+        return False
+    target_dir = os.path.join(DATA_DIR, subdir)
+    if not os.path.isdir(target_dir):
+        return False
+    return any(name.startswith(prefix) and name.endswith('.nc') for name in os.listdir(target_dir))
+
+
+def get_simulation_capabilities():
+    """Describe which optional simulation features are currently available."""
+    use_3d = bool(SETTINGS and SETTINGS.get('use_3D', False))
+    supports_wind = has_data_files('wind', 'Wind_')
+    supports_stokes = has_data_files('waves', 'Waves_')
+    supports_biofouling = use_3d and has_data_files('bgc', 'BGC_')
+    return {
+        "use_3d": use_3d,
+        "supports_wind": supports_wind,
+        "supports_stokes": supports_stokes,
+        "supports_biofouling": supports_biofouling,
+    }
 
 def build_land_mask(data_dir):
     """Build a 2D land mask for the data grid using Natural Earth coastline."""
@@ -209,7 +257,26 @@ def zarr_to_geojson(zarr_file):
     except Exception as e:
         raise Exception(f"Error converting zarr to GeoJSON: {e}")
 
-def run_trajectory_simulation(release_locations, simulation_hours=72, output_minutes=30, dt_minutes=5, start_date=None, plastic_density=None, plastic_diameter=None, wind_coefficient=None, use_stokes=False):
+def SurfaceWindageDrift(particle, fieldset, time):
+    """Custom windage kernel without the depth-restriction from the stock WindageDrift.
+
+    The built-in WindageDrift only fires when particle.depth < 0.5*plastic_diameter
+    (i.e. < 0.5 mm for 1-mm particles), which is never satisfied in 3-D sigma-level
+    grids where even the surface layer centre sits at ~0.5 m depth.
+
+    This kernel applies leeway to ALL particles, making it suitable for sigma-
+    coordinate ocean models such as STOFS-3D / SCHISM.
+    NOTE: Do not use 'import' statements inside Parcels kernels - they are transpiled to C.
+    """
+    (ocean_U, ocean_V) = fieldset.UV[particle]
+    wind_U = fieldset.Wind_U[time, particle.depth, particle.lat, particle.lon]
+    wind_V = fieldset.Wind_V[time, particle.depth, particle.lat, particle.lon]
+    # Leeway: u_eff = u_ocean + C_w * (u_wind - u_ocean)
+    particle_dlon += particle.wind_coefficient * (wind_U - ocean_U) * particle.dt  # noqa
+    particle_dlat += particle.wind_coefficient * (wind_V - ocean_V) * particle.dt  # noqa
+
+
+def run_trajectory_simulation(release_locations, simulation_hours=72, output_minutes=30, dt_minutes=5, start_date=None, plastic_density=None, plastic_diameter=None, wind_coefficient=None, use_biofouling=False, use_stokes=True):
     """Run PlasticParcels simulation with given release locations."""
     try:
         # Import PlasticParcels
@@ -227,6 +294,9 @@ def run_trajectory_simulation(release_locations, simulation_hours=72, output_min
             if not os.path.isabs(ocean_dir):
                 # If it's relative, make it relative to DATA_DIR
                 settings['ocean']['directory'] = os.path.join(DATA_DIR, '')
+
+        # Apply use_biofouling flag (must be in settings before create_hydrodynamic_fieldset)
+        settings['use_biofouling'] = bool(use_biofouling)
 
         # Add simulation settings
         # Use provided start_date or determine from available data
@@ -259,9 +329,8 @@ def run_trajectory_simulation(release_locations, simulation_hours=72, output_min
             'dt': timedelta(minutes=dt_minutes),
         }
 
-        # Determine wind coefficient
-        use_wind = wind_coefficient is not None and wind_coefficient > 0
-        actual_wind_coefficient = float(wind_coefficient) if use_wind else 0.0
+        # Determine wind coefficient (used by WindageDrift kernel magnitude)
+        actual_wind_coefficient = float(wind_coefficient) if wind_coefficient is not None else 0.0
 
         settings['plastictype'] = {
             'wind_coefficient': actual_wind_coefficient,
@@ -273,90 +342,149 @@ def run_trajectory_simulation(release_locations, simulation_hours=72, output_min
         # Create fieldset
         fieldset = create_hydrodynamic_fieldset(settings)
 
-        # Load wind fields if wind coefficient > 0 (must be done BEFORE creating particleset)
+        # Load optional wind/wave fields (must be done BEFORE creating particleset)
         wind_loaded = False
-        if use_wind:
-            wind_dir = os.path.join(DATA_DIR, 'wind')
-            wind_file = os.path.join(wind_dir, f'Wind_{start_date.strftime("%Y-%m-%d")}.nc')
-            print(f"Looking for wind file: {wind_file}")
-
-            if os.path.exists(wind_file):
-                try:
-                    from parcels import FieldSet as ParcelsFieldSet
-                    from parcels.tools.converters import Geographic, GeographicPolar
-
-                    filenames_wind = {'Wind_U': wind_file, 'Wind_V': wind_file}
-                    variables_wind = {'Wind_U': 'u10', 'Wind_V': 'v10'}
-                    dimensions_wind = {'lon': 'longitude', 'lat': 'latitude', 'time': 'time'}
-
-                    fieldset_wind = ParcelsFieldSet.from_netcdf(
-                        filenames_wind, variables_wind, dimensions_wind,
-                        mesh='spherical', allow_time_extrapolation=True
-                    )
-                    fieldset_wind.Wind_U.units = GeographicPolar()
-                    fieldset_wind.Wind_V.units = Geographic()
-
-                    fieldset.add_field(fieldset_wind.Wind_U)
-                    fieldset.add_field(fieldset_wind.Wind_V)
-
-                    wind_loaded = True
-                    print(f"Wind fields loaded from {wind_file}")
-                except Exception as e:
-                    print(f"WARNING: Failed to load wind fields: {e}")
-                    wind_loaded = False
-            else:
-                print(f"WARNING: Wind file not found: {wind_file}. Running without wind.")
-
-
-        # Load Stokes drift fields if enabled (must be done BEFORE creating particleset)
-        # NOTE: We keep fieldset.use_stokes = False so create_kernel() doesn't add
-        # the unbeaching kernel (which requires unbeach_U/V fields we don't have).
-        # Instead, we manually insert the StokesDrift kernel after create_kernel().
         stokes_loaded = False
+
+        wind_dir = os.path.join(DATA_DIR, 'wind')
+        wind_file = os.path.join(wind_dir, f'Wind_{start_date.strftime("%Y-%m-%d")}.nc')
+        print(f"Looking for wind file: {wind_file}")
+
+        if os.path.exists(wind_file):
+            try:
+                from parcels import FieldSet as ParcelsFieldSet
+                from parcels.tools.converters import Geographic, GeographicPolar
+
+                filenames_wind = {'Wind_U': wind_file, 'Wind_V': wind_file}
+                variables_wind = {'Wind_U': 'u10', 'Wind_V': 'v10'}
+                dimensions_wind = {'lon': 'longitude', 'lat': 'latitude', 'time': 'time'}
+
+                fieldset_wind = ParcelsFieldSet.from_netcdf(
+                    filenames_wind, variables_wind, dimensions_wind,
+                    mesh='spherical', allow_time_extrapolation=True
+                )
+                fieldset_wind.Wind_U.units = GeographicPolar()
+                fieldset_wind.Wind_V.units = Geographic()
+
+                fieldset.add_field(fieldset_wind.Wind_U)
+                fieldset.add_field(fieldset_wind.Wind_V)
+
+                wind_loaded = True
+                print(f"Wind fields loaded from {wind_file}")
+            except Exception as e:
+                print(f"WARNING: Failed to load wind fields: {e}")
+                wind_loaded = False
+        else:
+            print(f"WARNING: Wind file not found: {wind_file}. Running without wind.")
+
+        # Stokes is enabled when use_stokes=True AND a matching waves file exists.
+        waves_dir = os.path.join(DATA_DIR, 'waves')
+        waves_file = os.path.join(waves_dir, f'Waves_{start_date.strftime("%Y-%m-%d")}.nc')
         if use_stokes:
-            wave_dir = os.path.join(DATA_DIR, 'waves')
-            wave_file = os.path.join(wave_dir, f'Waves_{start_date.strftime("%Y-%m-%d")}.nc')
-            print(f"Looking for wave file: {wave_file}")
+            print(f"Looking for waves file: {waves_file}")
+        else:
+            print("Stokes drift disabled by use_stokes=False.")
+        if use_stokes and os.path.exists(waves_file):
+            try:
+                from parcels import FieldSet as ParcelsFieldSet
+                from parcels.tools.converters import Geographic, GeographicPolar
 
-            if os.path.exists(wave_file):
+                filenames_stokes = {'Stokes_U': waves_file, 'Stokes_V': waves_file, 'wave_Tp': waves_file}
+                variables_stokes = {'Stokes_U': 'Stokes_U', 'Stokes_V': 'Stokes_V', 'wave_Tp': 'wave_Tp'}
+                dimensions_stokes = {'lon': 'longitude', 'lat': 'latitude', 'time': 'time'}
+
+                fieldset_stokes = ParcelsFieldSet.from_netcdf(
+                    filenames_stokes, variables_stokes, dimensions_stokes,
+                    mesh='spherical', allow_time_extrapolation=True
+                )
+                fieldset_stokes.Stokes_U.units = GeographicPolar()
+                fieldset_stokes.Stokes_V.units = Geographic()
+
+                fieldset.add_field(fieldset_stokes.Stokes_U)
+                fieldset.add_field(fieldset_stokes.Stokes_V)
+                fieldset.add_field(fieldset_stokes.wave_Tp)
+
+                stokes_loaded = True
+                print(f"Stokes fields loaded from {waves_file}")
+            except Exception as e:
+                print(f"WARNING: Failed to load Stokes fields: {e}")
+                stokes_loaded = False
+        else:
+            print(f"WARNING: Waves file not found: {waves_file}. Running without Stokes drift.")
+
+        # ── BGC fields for biofouling ──────────────────────────────────────────
+        if use_biofouling:
+            bgc_dir = os.path.join(DATA_DIR, 'bgc')
+            bgc_file = os.path.join(bgc_dir, f'BGC_{start_date.strftime("%Y-%m-%d")}.nc')
+
+            # Fallback: find the closest available BGC file
+            if not os.path.exists(bgc_file) and os.path.isdir(bgc_dir):
+                available_bgc = sorted([
+                    f for f in os.listdir(bgc_dir) if f.startswith('BGC_') and f.endswith('.nc')
+                ])
+                if available_bgc:
+                    bgc_file = os.path.join(bgc_dir, available_bgc[-1])
+                    print(f"BGC file for {start_date.date()} not found; using {available_bgc[-1]}")
+
+            if os.path.exists(bgc_file):
+                # ── Pre-validate BGC file to avoid segfault in C netCDF/HDF5 layer ──
+                # ParcelsField.from_netcdf segfaults on malformed/stub files; always
+                # check with netCDF4 first before handing off to Parcels.
+                _required_bgc_vars = ('nppv', 'phy', 'phy2')
+                _bgc_valid = False
                 try:
-                    from parcels import FieldSet as ParcelsFieldSet
-                    from parcels.tools.converters import Geographic, GeographicPolar
+                    import netCDF4 as _nc4
+                    with _nc4.Dataset(bgc_file) as _ds:
+                        _file_vars = set(_ds.variables.keys())
+                        _missing = [v for v in _required_bgc_vars if v not in _file_vars]
+                        if _missing:
+                            print(f"WARNING: BGC file missing required variables {_missing}. "
+                                  "Biofouling disabled for this run.")
+                        else:
+                            _bgc_valid = True
+                except Exception as _e:
+                    print(f"WARNING: Could not validate BGC file: {_e}. "
+                          "Biofouling disabled for this run.")
 
-                    filenames_stokes = {
-                        'Stokes_U': wave_file,
-                        'Stokes_V': wave_file,
-                        'wave_Tp': wave_file,
-                    }
-                    variables_stokes = {
-                        'Stokes_U': 'Stokes_U',
-                        'Stokes_V': 'Stokes_V',
-                        'wave_Tp': 'wave_Tp',
-                    }
-                    dimensions_stokes = {
-                        'lon': 'longitude',
-                        'lat': 'latitude',
-                        'time': 'time',
-                    }
+                if _bgc_valid:
+                    try:
+                        from parcels import Field as ParcelsField
+                        bgc_dims = {'lon': 'longitude', 'lat': 'latitude',
+                                    'depth': 'depth', 'time': 'time'}
 
-                    fieldset_stokes = ParcelsFieldSet.from_netcdf(
-                        filenames_stokes, variables_stokes, dimensions_stokes,
-                        mesh='spherical', allow_time_extrapolation=True
-                    )
-                    fieldset_stokes.Stokes_U.units = GeographicPolar()
-                    fieldset_stokes.Stokes_V.units = Geographic()
+                        pp_phyto = ParcelsField.from_netcdf(
+                            bgc_file, ('pp_phyto', 'nppv'), bgc_dims,
+                            mesh='spherical', allow_time_extrapolation=True)
+                        bio_nanophy = ParcelsField.from_netcdf(
+                            bgc_file, ('bio_nanophy', 'phy'), bgc_dims,
+                            mesh='spherical', allow_time_extrapolation=True)
+                        bio_diatom = ParcelsField.from_netcdf(
+                            bgc_file, ('bio_diatom', 'phy2'), bgc_dims,
+                            mesh='spherical', allow_time_extrapolation=True)
 
-                    fieldset.add_field(fieldset_stokes.Stokes_U)
-                    fieldset.add_field(fieldset_stokes.Stokes_V)
-                    fieldset.add_field(fieldset_stokes.wave_Tp)
+                        fieldset.add_field(pp_phyto)
+                        fieldset.add_field(bio_nanophy)
+                        fieldset.add_field(bio_diatom)
 
-                    stokes_loaded = True
-                    print(f"Stokes drift fields loaded from {wave_file}")
-                except Exception as e:
-                    print(f"WARNING: Failed to load Stokes drift fields: {e}")
-                    stokes_loaded = False
+                        # Add BGC constants from settings
+                        bgc_constants = settings.get('bgc', {}).get('constants', {})
+                        for key, val in bgc_constants.items():
+                            fieldset.add_constant(key, val)
+
+                        print(f"✅ BGC fields loaded from {bgc_file}")
+                    except Exception as e:
+                        print(f"WARNING: Failed to load BGC fields: {e}. "
+                              "Biofouling disabled for this run.")
+                        settings['use_biofouling'] = False
+                        fieldset.use_biofouling = 0
+                else:
+                    settings['use_biofouling'] = False
+                    fieldset.use_biofouling = 0
             else:
-                print(f"WARNING: Wave file not found: {wave_file}. Running without Stokes drift.")
+                print(f"WARNING: BGC file not found: {bgc_file}. "
+                      "Biofouling disabled for this run.")
+                settings['use_biofouling'] = False
+                fieldset.use_biofouling = 0
 
         # Create particle set
         pset = create_particleset(fieldset, settings, release_locations)
@@ -374,46 +502,45 @@ def run_trajectory_simulation(release_locations, simulation_hours=72, output_min
             kernels = create_kernel(fieldset)
             print(f"Running 3D simulation with full kernel chain (including SettlingVelocity)...")
 
-            # Add WindageDrift kernel if wind fields were loaded
-            if wind_loaded:
-                from plasticparcels.kernels import WindageDrift
-                # Insert WindageDrift after SettlingVelocity but before status-check kernels
-                # Find position after last physics kernel (before checkThroughBathymetry/periodicBC/deleteParticle)
+            def _kernel_name(kernel_obj):
+                name = getattr(kernel_obj, '__name__', None)
+                if name:
+                    return name
+                pyfunc = getattr(kernel_obj, 'pyfunc', None)
+                return getattr(pyfunc, '__name__', None)
+
+            def _has_kernel(name):
+                return any(_kernel_name(k) == name for k in kernels)
+
+            def _insert_before_status_checks(kernel_fn):
                 insert_pos = len(kernels)
                 for i, k in enumerate(kernels):
-                    if hasattr(k, '__name__') and k.__name__ in ('checkThroughBathymetry', 'checkErrorThroughSurface', 'periodicBC', 'deleteParticle'):
+                    if _kernel_name(k) in ('checkThroughBathymetry', 'checkErrorThroughSurface', 'periodicBC', 'deleteParticle'):
                         insert_pos = i
                         break
-                kernels.insert(insert_pos, WindageDrift)
-                print(f"Added WindageDrift kernel (wind_coefficient={actual_wind_coefficient})")
+                kernels.insert(insert_pos, kernel_fn)
 
-            # Add StokesDrift kernel if Stokes fields were loaded
-            if stokes_loaded:
+            if stokes_loaded and not _has_kernel('StokesDrift'):
                 from plasticparcels.kernels import StokesDrift
-                insert_pos = len(kernels)
-                for i, k in enumerate(kernels):
-                    if hasattr(k, '__name__') and k.__name__ in ('checkThroughBathymetry', 'checkErrorThroughSurface', 'periodicBC', 'deleteParticle'):
-                        insert_pos = i
-                        break
-                kernels.insert(insert_pos, StokesDrift)
-                print(f"Added StokesDrift kernel")
+                _insert_before_status_checks(StokesDrift)
+                print("Added StokesDrift kernel")
 
-            # Add unbeaching kernel if wind or Stokes drift is active
-            # Uses unbeachingBySamplingAfterwards which requires no special fields -
-            # it samples velocity in cardinal directions to find the ocean direction
-            if wind_loaded or stokes_loaded:
-                from plasticparcels.kernels import unbeachingBySamplingAfterwards
-                insert_pos = len(kernels)
-                for i, k in enumerate(kernels):
-                    if hasattr(k, '__name__') and k.__name__ in ('checkThroughBathymetry', 'checkErrorThroughSurface', 'periodicBC', 'deleteParticle'):
-                        insert_pos = i
-                        break
-                kernels.insert(insert_pos, unbeachingBySamplingAfterwards)
-                print(f"Added unbeachingBySamplingAfterwards kernel")
-
+            if wind_loaded and actual_wind_coefficient > 0 and not _has_kernel('SurfaceWindageDrift'):
+                _insert_before_status_checks(SurfaceWindageDrift)
+                print(f"Added SurfaceWindageDrift kernel (wind_coefficient={actual_wind_coefficient})")
         else:
-            kernels = parcels.AdvectionRK4
-            print(f"Running 2D simulation (horizontal advection only)...")
+            from plasticparcels.kernels import StokesDrift, periodicBC, deleteParticle
+
+            kernels = [parcels.AdvectionRK4]
+            if stokes_loaded:
+                kernels.append(StokesDrift)
+                print("Added StokesDrift kernel to 2D simulation")
+            if wind_loaded and actual_wind_coefficient > 0:
+                kernels.append(SurfaceWindageDrift)
+                print(f"Added SurfaceWindageDrift kernel to 2D simulation (wind_coefficient={actual_wind_coefficient})")
+            kernels.append(periodicBC)
+            kernels.append(deleteParticle)
+            print(f"Running 2D simulation with optional surface forcing...")
 
         # Run simulation
         pset.execute(
@@ -423,9 +550,15 @@ def run_trajectory_simulation(release_locations, simulation_hours=72, output_min
             output_file=pset.ParticleFile(name=output_file, outputdt=settings['simulation']['outputdt'])
         )
 
+        # Explicit memory cleanup: free large C-extension objects before returning
+        del pset
+        del fieldset
+        gc.collect()
         return output_file
 
     except Exception as e:
+        del fieldset, pset  # noqa: F821 — may be partially initialised
+        gc.collect()
         raise Exception(f"Simulation failed: {e}")
 
 @app.route('/', methods=['GET'])
@@ -468,7 +601,8 @@ def simulate_trajectories():
         "simulation_hours": 72 (optional, default 72),
         "output_minutes": 30 (optional, default 30),
         "dt_minutes": 5 (optional, default 5),
-        "start_date": "2025-10-13T00:00:00Z" (optional, auto-detected if not provided)
+        "start_date": "2025-10-13T00:00:00Z" (optional, auto-detected if not provided),
+        "use_biofouling": false (optional, default false — enables algal biofouling settling)
     }
 
     Returns GeoJSON FeatureCollection with trajectory LineStrings.
@@ -495,9 +629,33 @@ def simulate_trajectories():
         if len(lons) == 0:
             return jsonify({"error": "At least one release location is required"}), 400
 
+        # Cap particle count to avoid OOM
+        MAX_PARTICLES = 100
+        if len(lons) > MAX_PARTICLES:
+            return jsonify({
+                "error": f"Too many particles requested ({len(lons)}). Maximum is {MAX_PARTICLES}."
+            }), 400
+
+        # Memory guard: require at least 4 GB of free RAM before starting
+        try:
+            with open('/proc/meminfo') as _mi:
+                _avail_kb = next(
+                    int(ln.split()[1]) for ln in _mi if ln.startswith('MemAvailable')
+                )
+            _avail_gb = _avail_kb / 1_048_576
+            if _avail_gb < 4.0:
+                return jsonify({
+                    "error": f"Server memory is low ({_avail_gb:.1f} GB available). "
+                              "Please try again in a few seconds."
+                }), 503
+        except Exception:
+            pass  # If we can't read meminfo, proceed anyway
+
         # Add plastic_amount if not provided
         if 'plastic_amount' not in release_locations:
             release_locations['plastic_amount'] = [1.0] * len(lons)
+
+        capabilities = get_simulation_capabilities()
 
         # Get simulation parameters
         simulation_hours = data.get('simulation_hours', 72)
@@ -542,12 +700,28 @@ def simulate_trajectories():
         if wind_coefficient is not None:
             wind_coefficient = float(wind_coefficient)
 
-        # Get Stokes drift toggle from request (optional)
-        use_stokes = data.get('use_stokes', False)
-        use_stokes = bool(use_stokes)
+        # Get biofouling flag from request (optional, default False)
+        try:
+            use_biofouling = parse_bool(data.get('use_biofouling'), default=False)
+            use_stokes = parse_bool(data.get('use_stokes'), default=True)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
 
-        # Run simulation
-        output_file = run_trajectory_simulation(
+        if use_biofouling and not capabilities['supports_biofouling']:
+            return jsonify({
+                "error": "Biofouling is not available for the current dataset configuration",
+                "capabilities": capabilities
+            }), 400
+
+        # Run simulation (serialized to avoid HDF5 thread conflicts).
+        # Non-blocking acquire: if another simulation is already running, return
+        # 429 immediately instead of queuing and doubling peak memory usage.
+        if not SIM_LOCK.acquire(blocking=False):
+            return jsonify({
+                "error": "A simulation is already running. Please wait a few seconds and try again."
+            }), 429
+        try:
+            output_file = run_trajectory_simulation(
             release_locations,
             simulation_hours,
             output_minutes,
@@ -556,20 +730,94 @@ def simulate_trajectories():
             plastic_density,
             plastic_diameter,
             wind_coefficient,
-            use_stokes
+            use_biofouling,
+            use_stokes,
         )
+        finally:
+            SIM_LOCK.release()
 
-        # Convert to GeoJSON
-        geojson = zarr_to_geojson(output_file)
-
-        # Clean up temporary file
-        if os.path.exists(output_file):
-            shutil.rmtree(output_file)
+        # Convert to GeoJSON; always clean up zarr dir even on conversion error
+        try:
+            geojson = zarr_to_geojson(output_file)
+        finally:
+            if output_file and os.path.exists(output_file):
+                shutil.rmtree(output_file, ignore_errors=True)
 
         return jsonify(geojson)
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+def _get_vector_cache(date_str, u_file, v_file):
+    """Load U/V arrays for date_str into VECTOR_CACHE (once), then return the entry."""
+    global VECTOR_CACHE
+    if date_str in VECTOR_CACHE:
+        return VECTOR_CACHE[date_str]
+
+    print(f"[vector-cache] Loading {date_str} into memory cache...")
+    u_ds = xr.open_dataset(u_file)
+    v_ds = xr.open_dataset(v_file)
+    try:
+        u_var = next((v for v in ['vozocrtx', 'u', 'eastward_velocity', 'u_velocity']
+                      if v in u_ds.data_vars), None)
+        v_var = next((v for v in ['vomecrty', 'v', 'northward_velocity', 'v_velocity']
+                      if v in v_ds.data_vars), None)
+        if u_var is None:
+            u_var = next(iter(u_ds.data_vars))
+        if v_var is None:
+            v_var = next(iter(v_ds.data_vars))
+
+        u_full = u_ds[u_var]
+        v_full = v_ds[v_var]
+
+        # ── times ──────────────────────────────────────────────────────────
+        time_dim = next((d for d in u_full.dims if 'time' in d.lower()), None)
+        if time_dim:
+            raw_times = u_full[time_dim].values
+            times = pd.to_datetime(raw_times, utc=True)
+        else:
+            times = pd.DatetimeIndex([])
+
+        # ── depths ─────────────────────────────────────────────────────────
+        depth_dim = next((d for d in ['depthw', 'depthu', 'depthv', 'depth']
+                          if d in u_full.dims), None)
+        depth_values = u_full[depth_dim].values if depth_dim else np.array([0.0])
+
+        # ── lat/lon grids ──────────────────────────────────────────────────
+        if 'nav_lat' in u_ds.data_vars and 'nav_lon' in u_ds.data_vars:
+            lats = u_ds.nav_lat.values
+            lons = u_ds.nav_lon.values
+        elif 'nav_lat' in u_full.coords:
+            lats = u_full.nav_lat.values
+            lons = u_full.nav_lon.values
+        elif 'lat' in u_full.coords:
+            lats = u_full.lat.values
+            lons = u_full.lon.values
+        else:
+            lats = u_full.latitude.values
+            lons = u_full.longitude.values
+
+        if lats.ndim == 1:
+            lons, lats = np.meshgrid(lons, lats)
+
+        # ── load full arrays into RAM (small: ~14 MB per var per date) ─────
+        u_arr = u_full.values  # (time, depth, y, x)
+        v_arr = v_full.values
+
+        entry = {
+            'u': u_arr, 'v': v_arr,
+            'lats': lats, 'lons': lons,
+            'times': times, 'depth_values': depth_values,
+            'time_dim': time_dim, 'depth_dim': depth_dim,
+            'files': [u_file, v_file],
+        }
+        VECTOR_CACHE[date_str] = entry
+        print(f"[vector-cache] {date_str} cached: u={u_arr.shape}, {u_arr.nbytes/1e6:.1f} MB")
+        return entry
+    finally:
+        u_ds.close()
+        v_ds.close()
 
 @app.route('/vector-field', methods=['GET'])
 def get_vector_field():
@@ -587,28 +835,15 @@ def get_vector_field():
         if not timestamp:
             return jsonify({"error": "timestamp parameter required"}), 400
             
-        # Parse timestamp to find appropriate NetCDF files
+        # Parse timestamp once and normalize to UTC for robust matching
         try:
-            import pandas as pd
-            # More robust timestamp parsing
-            if timestamp.endswith('Z'):
-                timestamp_clean = timestamp[:-1] + '+00:00'
-            else:
-                timestamp_clean = timestamp
-            
-            # Try multiple parsing methods
-            try:
-                dt = datetime.fromisoformat(timestamp_clean)
-            except:
-                dt = pd.to_datetime(timestamp).to_pydatetime()
-            
-            date_str = dt.strftime('%Y-%m-%d')
-            print(f"Parsed timestamp {timestamp} -> date {date_str}")
+            requested_time_utc = pd.to_datetime(timestamp, utc=True)
+            # Use timezone-naive datetime only where date strings are needed
+            dt = requested_time_utc.tz_localize(None).to_pydatetime()
+            date_str = requested_time_utc.strftime('%Y-%m-%d')
+            print(f"Parsed timestamp {timestamp} -> {requested_time_utc.isoformat()} (date {date_str})")
         except Exception as e:
-            print(f"Timestamp parsing error: {e}")
-            # Fallback to a default date if parsing fails
-            date_str = '2024-01-01'
-            print(f"Using fallback date: {date_str}")
+            return jsonify({"error": f"Invalid timestamp format: {timestamp} ({e})"}), 400
             
         # Find U and V files for the date
         u_file = os.path.join(DATA_DIR, f'U_{date_str}.nc')
@@ -661,236 +896,97 @@ def get_vector_field():
             else:
                 return jsonify({"error": f"No ocean current data available for {date_str}"}), 404
                 
-        # Load NetCDF data
-        u_ds = xr.open_dataset(u_file)
-        v_ds = xr.open_dataset(v_file)
-        
-        # Get variable names for SCHISM ocean model
-        # U variable is 'vozocrtx', V variable is 'vomecrty'
-        u_var = None
-        v_var = None
-        
-        # Check for SCHISM variable names first
-        if 'vozocrtx' in u_ds.data_vars:
-            u_var = 'vozocrtx'
-        elif 'u' in u_ds.data_vars:
-            u_var = 'u'
-        else:
-            # Try other common names
-            for var in u_ds.data_vars:
-                if var.lower() in ['u', 'eastward_velocity', 'u_velocity']:
-                    u_var = var
-                    break
-                    
-        if 'vomecrty' in v_ds.data_vars:
-            v_var = 'vomecrty'
-        elif 'v' in v_ds.data_vars:
-            v_var = 'v'
-        else:
-            # Try other common names
-            for var in v_ds.data_vars:
-                if var.lower() in ['v', 'northward_velocity', 'v_velocity']:
-                    v_var = var
-                    break
-                
-        if u_var is None or v_var is None:
-            available_vars = list(u_ds.data_vars) + list(v_ds.data_vars)
-            return jsonify({"error": f"Could not find U/V velocity variables. Available: {available_vars}"}), 500
-            
-        print(f"Using variables: U={u_var}, V={v_var}")
-            
-        # Get the appropriate time step based on requested timestamp
-        # SCHISM uses 'time_counter' instead of 'time'
-        u_full = u_ds[u_var]
-        v_full = v_ds[v_var]
-        
-        # Find the best time index for the requested timestamp
-        time_index = 0  # Default to first time step
-        
-        if 'time_counter' in u_full.dims:
-            time_coords = u_full.time_counter.values
-            print(f"Available time steps: {len(time_coords)}")
-            print(f"Time range: {time_coords[0]} to {time_coords[-1]}")
-            
-            # Parse the requested timestamp - simplified approach
-            try:
-                import numpy as np
-                from datetime import datetime
-                import pandas as pd
-                
-                print(f"Raw timestamp received: {timestamp}")
-                
-                # Parse the requested timestamp
-                if timestamp.endswith('Z'):
-                    timestamp = timestamp[:-1] + '+00:00'
-                
-                requested_time = pd.to_datetime(timestamp)
-                print(f"Parsed requested time: {requested_time}")
-                
-                # Convert time coordinates to pandas datetime for easier comparison
-                time_coords_pd = pd.to_datetime(time_coords)
-                print(f"Time coords range: {time_coords_pd[0]} to {time_coords_pd[-1]}")
-                
-                # Find the closest time index
-                time_diffs = np.abs(time_coords_pd - requested_time)
-                time_index = int(np.argmin(time_diffs))
-                
-                closest_time = time_coords_pd[time_index]
-                print(f"Using time index {time_index}: {closest_time}")
-                
-            except Exception as e:
-                print(f"Error parsing timestamp: {e}")
-                print(f"Timestamp type: {type(timestamp)}")
-                print(f"Time coords type: {type(time_coords)}")
-                print(f"Time coords sample: {time_coords[:3] if len(time_coords) > 0 else 'empty'}")
-                # For now, use a simple hour-based approach as fallback
-                try:
-                    # Extract hour from timestamp and use modulo for cycling
-                    hour_match = timestamp.split('T')[1].split(':')[0] if 'T' in timestamp else '0'
-                    hour = int(hour_match) % len(time_coords)
-                    time_index = hour
-                    print(f"Fallback: using hour-based index {time_index}")
-                except:
-                    time_index = 0
-                    print("Using first time step as final fallback")
-            
-            u_data = u_full.isel(time_counter=time_index)
-            v_data = v_full.isel(time_counter=time_index)
-            
-        elif 'time' in u_full.dims:
-            # Similar logic for 'time' dimension
-            time_coords = u_full.time.values
-            try:
-                from datetime import datetime
-                import numpy as np
-                
-                requested_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-                requested_np_time = np.datetime64(requested_time)
-                time_diffs = np.abs(time_coords - requested_np_time)
-                time_index = int(np.argmin(time_diffs))
-                print(f"Using time index {time_index} from 'time' dimension")
-            except Exception as e:
-                print(f"Error parsing timestamp for 'time' dimension: {e}")
-                time_index = 0
-                
-            u_data = u_full.isel(time=time_index)
-            v_data = v_full.isel(time=time_index)
-            
-        else:
-            # Use first time step regardless of dimension name
-            time_dims = [d for d in u_full.dims if 'time' in d.lower()]
-            if time_dims:
-                time_dim = time_dims[0]
-                u_data = u_full.isel({time_dim: 0})
-                v_data = v_full.isel({time_dim: 0})
-                print(f"Using first time step from dimension: {time_dim}")
-            else:
-                # No time dimension, use data as is
-                u_data = u_full
-                v_data = v_full
-                print("No time dimension found, using data as-is")
-        
-        # Select depth level closest to requested depth
-        depth_index = 0  # default: surface
-        selected_depth = 0.0
-        for depth_dim in ['depthw', 'depthu', 'depthv', 'depth']:
-            if depth_dim in u_data.dims:
-                depth_values = u_data[depth_dim].values
-                # Find closest depth level (depths are positive: 0, 5, 10, 20, ...)
-                abs_requested = abs(requested_depth)  # handle negative depths too
-                depth_index = int(np.argmin(np.abs(depth_values - abs_requested)))
-                selected_depth = float(depth_values[depth_index])
-                u_data = u_data.isel({depth_dim: depth_index})
-                print(f"Requested depth: {requested_depth}m -> selected depth level {depth_index}: {selected_depth}m (dim: {depth_dim})")
-                break
-        for depth_dim in ['depthw', 'depthu', 'depthv', 'depth']:
-            if depth_dim in v_data.dims:
-                v_data = v_data.isel({depth_dim: depth_index})
-                break
-        
-        print(f"u_data shape after time/depth selection: {u_data.shape}")
+        # Use cached numpy arrays — avoids opening NC files on every zoom/pan event
+        with VF_LOCK:
+            entry = _get_vector_cache(date_str, u_file, v_file)
 
-        # Get coordinate arrays for SCHISM format
-        # SCHISM uses 'nav_lat' and 'nav_lon' as data variables (not coordinates)
-        if 'nav_lat' in u_ds.data_vars and 'nav_lon' in u_ds.data_vars:
-            lats = u_ds.nav_lat.values
-            lons = u_ds.nav_lon.values
-            print(f"Using SCHISM data variables: nav_lat, nav_lon")
-        elif 'nav_lat' in u_data.coords and 'nav_lon' in u_data.coords:
-            lats = u_data.nav_lat.values
-            lons = u_data.nav_lon.values
-            print(f"Using SCHISM coordinates: nav_lat, nav_lon")
-        elif 'lat' in u_data.coords:
-            lats = u_data.lat.values
-            lons = u_data.lon.values
-        elif 'latitude' in u_data.coords:
-            lats = u_data.latitude.values
-            lons = u_data.longitude.values
-        else:
-            available_coords = list(u_data.coords)
-            available_vars = list(u_ds.data_vars)
-            return jsonify({"error": f"Could not find lat/lon coordinates. Available coords: {available_coords}, Available vars: {available_vars}"}), 500
-            
-        print(f"Coordinate shapes: lats={lats.shape}, lons={lons.shape}")
-            
-        # Create meshgrid if needed
-        if len(lats.shape) == 1 and len(lons.shape) == 1:
-            lon_grid, lat_grid = np.meshgrid(lons, lats)
-        else:
-            lat_grid = lats
-            lon_grid = lons
-            
+        u_arr        = entry['u']           # full numpy array (may be N-D)
+        v_arr        = entry['v']
+        lat_grid     = entry['lats']        # 2D (y, x)
+        lon_grid     = entry['lons']        # 2D (y, x)
+        times        = entry['times']       # pd.DatetimeIndex, UTC-aware
+        depth_values = entry['depth_values']
+        time_dim     = entry['time_dim']
+        depth_dim    = entry['depth_dim']
+
+        # --- Time slice -------------------------------------------------------
+        time_index = None
+        if time_dim and len(times) > 0:
+            try:
+                time_diffs = np.abs(times - requested_time_utc)
+                time_index = int(np.argmin(time_diffs))
+                print(f"Using time index {time_index}: {times[time_index]} (UTC)")
+            except Exception as e:
+                print(f"Error selecting time step: {e}; using index 0")
+                time_index = 0
+
+        # --- Depth slice ------------------------------------------------------
+        selected_depth = 0.0
+        depth_index = None
+        if depth_dim and len(depth_values) > 0:
+            abs_requested = abs(requested_depth)
+            depth_index = int(np.argmin(np.abs(depth_values - abs_requested)))
+            selected_depth = float(depth_values[depth_index])
+            print(f"Requested depth: {requested_depth}m -> index {depth_index}: {selected_depth}m")
+
+        # --- Extract 2D (y, x) slice from cached array ------------------------
+        u_2d = u_arr
+        v_2d = v_arr
+        if time_index is not None:
+            u_2d = u_2d[time_index]
+            v_2d = v_2d[time_index]
+        if depth_index is not None and u_2d.ndim > 2:
+            u_2d = u_2d[depth_index]
+            v_2d = v_2d[depth_index]
+        print(f"u_2d shape after time/depth selection: {u_2d.shape}")
+
+        # --- Bounding box + subsampling ---------------------------------------
         # Filter data to bounding box
         lat_mask = (lat_grid >= lat_min) & (lat_grid <= lat_max)
         lon_mask = (lon_grid >= lon_min) & (lon_grid <= lon_max)
         mask = lat_mask & lon_mask
-        
+
         # Subsample based on grid density with aspect ratio correction
-        if len(lat_grid.shape) == 2:
-            # Calculate aspect ratio of the requested region
+        if lat_grid.ndim == 2:
             lat_range = lat_max - lat_min
             lon_range = lon_max - lon_min
-            aspect_ratio = lon_range / lat_range
-            
-            # Adjust grid density for longitude to account for aspect ratio
-            # This ensures more uniform spacing in both directions
+            aspect_ratio = lon_range / lat_range if lat_range else 1.0
+
             grid_density_lat = grid_density
             grid_density_lon = max(grid_density, int(grid_density * aspect_ratio))
-            
+
             step_lat = max(1, lat_grid.shape[0] // grid_density_lat)
             step_lon = max(1, lat_grid.shape[1] // grid_density_lon)
-            
+
             print(f"Grid density adjustment: lat_range={lat_range:.1f}°, lon_range={lon_range:.1f}°, aspect_ratio={aspect_ratio:.1f}")
-            print(f"Grid densities: lat={grid_density_lat}, lon={grid_density_lon}")
             print(f"Steps: lat={step_lat}, lon={step_lon}")
-            
-            # Apply subsampling
-            lat_sub = lat_grid[::step_lat, ::step_lon]
-            lon_sub = lon_grid[::step_lat, ::step_lon]
+
+            lat_sub  = lat_grid[::step_lat, ::step_lon]
+            lon_sub  = lon_grid[::step_lat, ::step_lon]
             mask_sub = mask[::step_lat, ::step_lon]
-            u_sub = u_data.values[::step_lat, ::step_lon]
-            v_sub = v_data.values[::step_lat, ::step_lon]
+            u_sub    = u_2d[::step_lat, ::step_lon]
+            v_sub    = v_2d[::step_lat, ::step_lon]
         else:
-            # Handle 1D case
+            lats = lat_grid.ravel()
+            lons = lon_grid.ravel()
             lat_indices = np.where((lats >= lat_min) & (lats <= lat_max))[0]
             lon_indices = np.where((lons >= lon_min) & (lons <= lon_max))[0]
-            
+
             step_lat = max(1, len(lat_indices) // grid_density)
             step_lon = max(1, len(lon_indices) // grid_density)
-            
+
             lat_sub_idx = lat_indices[::step_lat]
             lon_sub_idx = lon_indices[::step_lon]
-            
+
             lat_sub = lats[lat_sub_idx]
             lon_sub = lons[lon_sub_idx]
-            
-            # Create subsampled data
-            u_sub = u_data.values[np.ix_(lat_sub_idx, lon_sub_idx)]
-            v_sub = v_data.values[np.ix_(lat_sub_idx, lon_sub_idx)]
-            
+
+            u_sub = u_2d[np.ix_(lat_sub_idx, lon_sub_idx)]
+            v_sub = v_2d[np.ix_(lat_sub_idx, lon_sub_idx)]
+
             lon_grid_sub, lat_grid_sub = np.meshgrid(lon_sub, lat_sub)
-            lat_sub = lat_grid_sub
-            lon_sub = lon_grid_sub
+            lat_sub  = lat_grid_sub
+            lon_sub  = lon_grid_sub
             mask_sub = np.ones_like(lat_sub, dtype=bool)
             
         # Create vector field data (skip land points using precomputed land mask)
@@ -921,10 +1017,6 @@ def get_vector_field():
                         "magnitude": magnitude
                     })
                     
-        # Close datasets
-        u_ds.close()
-        v_ds.close()
-        
         response_data = {
             "timestamp": timestamp,
             "vectors": vectors,
@@ -1003,8 +1095,8 @@ def get_wind_field():
         # Find closest time step
         time_index = 0
         try:
-            requested_time = pd.to_datetime(timestamp.replace('Z', '+00:00'))
-            time_coords = pd.to_datetime(ds.time.values)
+            requested_time = pd.to_datetime(timestamp, utc=True)
+            time_coords = pd.to_datetime(ds.time.values, utc=True)
             time_diffs = np.abs(time_coords - requested_time)
             time_index = int(np.argmin(time_diffs))
         except Exception as e:
@@ -1131,7 +1223,8 @@ def get_info():
                 "start": float(fieldset.U.grid.time[0]),
                 "end": float(fieldset.U.grid.time[-1])
             },
-            "data_directory": DATA_DIR
+            "data_directory": DATA_DIR,
+            "capabilities": get_simulation_capabilities()
         }
 
         return jsonify(info)
@@ -1174,7 +1267,8 @@ def get_data_range():
             "start_date": start_date,
             "end_date": end_date,
             "total_days": len(available_dates),
-            "available_dates": available_dates
+            "available_dates": available_dates,
+            "capabilities": get_simulation_capabilities()
         })
 
     except Exception as e:
