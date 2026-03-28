@@ -6,6 +6,7 @@ A Flask server that accepts plastic release locations and generates
 trajectories in GeoJSON format using PlasticParcels.
 """
 
+import gc
 import os
 import sys
 import json
@@ -35,6 +36,8 @@ DATA_DIR = None
 SETTINGS = None
 LAND_MASK = None  # 2D boolean array: True = land, False = ocean
 SIM_LOCK = threading.Lock()  # Serialize simulations to prevent HDF5 concurrency issues
+VF_LOCK = threading.Lock()   # Serialize /vector-field to prevent concurrent NC opens
+VECTOR_CACHE = {}            # {date_str: {u, v, lats, lons, times}} — preloaded numpy arrays
 
 
 def parse_bool(value, default=False):
@@ -547,9 +550,15 @@ def run_trajectory_simulation(release_locations, simulation_hours=72, output_min
             output_file=pset.ParticleFile(name=output_file, outputdt=settings['simulation']['outputdt'])
         )
 
+        # Explicit memory cleanup: free large C-extension objects before returning
+        del pset
+        del fieldset
+        gc.collect()
         return output_file
 
     except Exception as e:
+        del fieldset, pset  # noqa: F821 — may be partially initialised
+        gc.collect()
         raise Exception(f"Simulation failed: {e}")
 
 @app.route('/', methods=['GET'])
@@ -619,6 +628,28 @@ def simulate_trajectories():
 
         if len(lons) == 0:
             return jsonify({"error": "At least one release location is required"}), 400
+
+        # Cap particle count to avoid OOM
+        MAX_PARTICLES = 100
+        if len(lons) > MAX_PARTICLES:
+            return jsonify({
+                "error": f"Too many particles requested ({len(lons)}). Maximum is {MAX_PARTICLES}."
+            }), 400
+
+        # Memory guard: require at least 4 GB of free RAM before starting
+        try:
+            with open('/proc/meminfo') as _mi:
+                _avail_kb = next(
+                    int(ln.split()[1]) for ln in _mi if ln.startswith('MemAvailable')
+                )
+            _avail_gb = _avail_kb / 1_048_576
+            if _avail_gb < 4.0:
+                return jsonify({
+                    "error": f"Server memory is low ({_avail_gb:.1f} GB available). "
+                              "Please try again in a few seconds."
+                }), 503
+        except Exception:
+            pass  # If we can't read meminfo, proceed anyway
 
         # Add plastic_amount if not provided
         if 'plastic_amount' not in release_locations:
@@ -705,17 +736,88 @@ def simulate_trajectories():
         finally:
             SIM_LOCK.release()
 
-        # Convert to GeoJSON
-        geojson = zarr_to_geojson(output_file)
-
-        # Clean up temporary file
-        if os.path.exists(output_file):
-            shutil.rmtree(output_file)
+        # Convert to GeoJSON; always clean up zarr dir even on conversion error
+        try:
+            geojson = zarr_to_geojson(output_file)
+        finally:
+            if output_file and os.path.exists(output_file):
+                shutil.rmtree(output_file, ignore_errors=True)
 
         return jsonify(geojson)
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+def _get_vector_cache(date_str, u_file, v_file):
+    """Load U/V arrays for date_str into VECTOR_CACHE (once), then return the entry."""
+    global VECTOR_CACHE
+    if date_str in VECTOR_CACHE:
+        return VECTOR_CACHE[date_str]
+
+    print(f"[vector-cache] Loading {date_str} into memory cache...")
+    u_ds = xr.open_dataset(u_file)
+    v_ds = xr.open_dataset(v_file)
+    try:
+        u_var = next((v for v in ['vozocrtx', 'u', 'eastward_velocity', 'u_velocity']
+                      if v in u_ds.data_vars), None)
+        v_var = next((v for v in ['vomecrty', 'v', 'northward_velocity', 'v_velocity']
+                      if v in v_ds.data_vars), None)
+        if u_var is None:
+            u_var = next(iter(u_ds.data_vars))
+        if v_var is None:
+            v_var = next(iter(v_ds.data_vars))
+
+        u_full = u_ds[u_var]
+        v_full = v_ds[v_var]
+
+        # ── times ──────────────────────────────────────────────────────────
+        time_dim = next((d for d in u_full.dims if 'time' in d.lower()), None)
+        if time_dim:
+            raw_times = u_full[time_dim].values
+            times = pd.to_datetime(raw_times, utc=True)
+        else:
+            times = pd.DatetimeIndex([])
+
+        # ── depths ─────────────────────────────────────────────────────────
+        depth_dim = next((d for d in ['depthw', 'depthu', 'depthv', 'depth']
+                          if d in u_full.dims), None)
+        depth_values = u_full[depth_dim].values if depth_dim else np.array([0.0])
+
+        # ── lat/lon grids ──────────────────────────────────────────────────
+        if 'nav_lat' in u_ds.data_vars and 'nav_lon' in u_ds.data_vars:
+            lats = u_ds.nav_lat.values
+            lons = u_ds.nav_lon.values
+        elif 'nav_lat' in u_full.coords:
+            lats = u_full.nav_lat.values
+            lons = u_full.nav_lon.values
+        elif 'lat' in u_full.coords:
+            lats = u_full.lat.values
+            lons = u_full.lon.values
+        else:
+            lats = u_full.latitude.values
+            lons = u_full.longitude.values
+
+        if lats.ndim == 1:
+            lons, lats = np.meshgrid(lons, lats)
+
+        # ── load full arrays into RAM (small: ~14 MB per var per date) ─────
+        u_arr = u_full.values  # (time, depth, y, x)
+        v_arr = v_full.values
+
+        entry = {
+            'u': u_arr, 'v': v_arr,
+            'lats': lats, 'lons': lons,
+            'times': times, 'depth_values': depth_values,
+            'time_dim': time_dim, 'depth_dim': depth_dim,
+            'files': [u_file, v_file],
+        }
+        VECTOR_CACHE[date_str] = entry
+        print(f"[vector-cache] {date_str} cached: u={u_arr.shape}, {u_arr.nbytes/1e6:.1f} MB")
+        return entry
+    finally:
+        u_ds.close()
+        v_ds.close()
 
 @app.route('/vector-field', methods=['GET'])
 def get_vector_field():
@@ -794,213 +896,97 @@ def get_vector_field():
             else:
                 return jsonify({"error": f"No ocean current data available for {date_str}"}), 404
                 
-        # Load NetCDF data
-        u_ds = xr.open_dataset(u_file)
-        v_ds = xr.open_dataset(v_file)
-        
-        # Get variable names for SCHISM ocean model
-        # U variable is 'vozocrtx', V variable is 'vomecrty'
-        u_var = None
-        v_var = None
-        
-        # Check for SCHISM variable names first
-        if 'vozocrtx' in u_ds.data_vars:
-            u_var = 'vozocrtx'
-        elif 'u' in u_ds.data_vars:
-            u_var = 'u'
-        else:
-            # Try other common names
-            for var in u_ds.data_vars:
-                if var.lower() in ['u', 'eastward_velocity', 'u_velocity']:
-                    u_var = var
-                    break
-                    
-        if 'vomecrty' in v_ds.data_vars:
-            v_var = 'vomecrty'
-        elif 'v' in v_ds.data_vars:
-            v_var = 'v'
-        else:
-            # Try other common names
-            for var in v_ds.data_vars:
-                if var.lower() in ['v', 'northward_velocity', 'v_velocity']:
-                    v_var = var
-                    break
-                
-        if u_var is None or v_var is None:
-            available_vars = list(u_ds.data_vars) + list(v_ds.data_vars)
-            return jsonify({"error": f"Could not find U/V velocity variables. Available: {available_vars}"}), 500
-            
-        print(f"Using variables: U={u_var}, V={v_var}")
-            
-        # Get the appropriate time step based on requested timestamp
-        # SCHISM uses 'time_counter' instead of 'time'
-        u_full = u_ds[u_var]
-        v_full = v_ds[v_var]
-        
-        # Find the best time index for the requested timestamp
-        time_index = 0  # Default to first time step
-        
-        if 'time_counter' in u_full.dims:
-            time_coords = u_full.time_counter.values
-            print(f"Available time steps: {len(time_coords)}")
-            print(f"Time range: {time_coords[0]} to {time_coords[-1]}")
-            
-            # Parse and match timestamps in UTC to avoid tz-aware/naive mismatch
+        # Use cached numpy arrays — avoids opening NC files on every zoom/pan event
+        with VF_LOCK:
+            entry = _get_vector_cache(date_str, u_file, v_file)
+
+        u_arr        = entry['u']           # full numpy array (may be N-D)
+        v_arr        = entry['v']
+        lat_grid     = entry['lats']        # 2D (y, x)
+        lon_grid     = entry['lons']        # 2D (y, x)
+        times        = entry['times']       # pd.DatetimeIndex, UTC-aware
+        depth_values = entry['depth_values']
+        time_dim     = entry['time_dim']
+        depth_dim    = entry['depth_dim']
+
+        # --- Time slice -------------------------------------------------------
+        time_index = None
+        if time_dim and len(times) > 0:
             try:
-                print(f"Requested UTC time: {requested_time_utc.isoformat()}")
-
-                # Convert model timestamps to UTC-aware values
-                time_coords_pd = pd.to_datetime(time_coords, utc=True)
-                print(f"Time coords range (UTC): {time_coords_pd[0]} to {time_coords_pd[-1]}")
-
-                # Find closest available model time step
-                time_diffs = np.abs(time_coords_pd - requested_time_utc)
+                time_diffs = np.abs(times - requested_time_utc)
                 time_index = int(np.argmin(time_diffs))
+                print(f"Using time index {time_index}: {times[time_index]} (UTC)")
+            except Exception as e:
+                print(f"Error selecting time step: {e}; using index 0")
+                time_index = 0
 
-                closest_time = time_coords_pd[time_index]
-                print(f"Using time index {time_index}: {closest_time} (UTC)")
-            except Exception as e:
-                print(f"Error matching requested timestamp to model times: {e}")
-                print(f"Timestamp type: {type(timestamp)}")
-                print(f"Time coords type: {type(time_coords)}")
-                print(f"Time coords sample: {time_coords[:3] if len(time_coords) > 0 else 'empty'}")
-                time_index = 0
-                print("Fallback: using first time step")
-            
-            u_data = u_full.isel(time_counter=time_index)
-            v_data = v_full.isel(time_counter=time_index)
-            
-        elif 'time' in u_full.dims:
-            # Similar logic for 'time' dimension
-            time_coords = u_full.time.values
-            try:
-                time_coords_pd = pd.to_datetime(time_coords, utc=True)
-                time_diffs = np.abs(time_coords_pd - requested_time_utc)
-                time_index = int(np.argmin(time_diffs))
-                closest_time = time_coords_pd[time_index]
-                print(f"Using time index {time_index} from 'time' dimension: {closest_time} (UTC)")
-            except Exception as e:
-                print(f"Error parsing timestamp for 'time' dimension: {e}")
-                time_index = 0
-                
-            u_data = u_full.isel(time=time_index)
-            v_data = v_full.isel(time=time_index)
-            
-        else:
-            # Use first time step regardless of dimension name
-            time_dims = [d for d in u_full.dims if 'time' in d.lower()]
-            if time_dims:
-                time_dim = time_dims[0]
-                u_data = u_full.isel({time_dim: 0})
-                v_data = v_full.isel({time_dim: 0})
-                print(f"Using first time step from dimension: {time_dim}")
-            else:
-                # No time dimension, use data as is
-                u_data = u_full
-                v_data = v_full
-                print("No time dimension found, using data as-is")
-        
-        # Select depth level closest to requested depth
-        depth_index = 0  # default: surface
+        # --- Depth slice ------------------------------------------------------
         selected_depth = 0.0
-        for depth_dim in ['depthw', 'depthu', 'depthv', 'depth']:
-            if depth_dim in u_data.dims:
-                depth_values = u_data[depth_dim].values
-                # Find closest depth level (depths are positive: 0, 5, 10, 20, ...)
-                abs_requested = abs(requested_depth)  # handle negative depths too
-                depth_index = int(np.argmin(np.abs(depth_values - abs_requested)))
-                selected_depth = float(depth_values[depth_index])
-                u_data = u_data.isel({depth_dim: depth_index})
-                print(f"Requested depth: {requested_depth}m -> selected depth level {depth_index}: {selected_depth}m (dim: {depth_dim})")
-                break
-        for depth_dim in ['depthw', 'depthu', 'depthv', 'depth']:
-            if depth_dim in v_data.dims:
-                v_data = v_data.isel({depth_dim: depth_index})
-                break
-        
-        print(f"u_data shape after time/depth selection: {u_data.shape}")
+        depth_index = None
+        if depth_dim and len(depth_values) > 0:
+            abs_requested = abs(requested_depth)
+            depth_index = int(np.argmin(np.abs(depth_values - abs_requested)))
+            selected_depth = float(depth_values[depth_index])
+            print(f"Requested depth: {requested_depth}m -> index {depth_index}: {selected_depth}m")
 
-        # Get coordinate arrays for SCHISM format
-        # SCHISM uses 'nav_lat' and 'nav_lon' as data variables (not coordinates)
-        if 'nav_lat' in u_ds.data_vars and 'nav_lon' in u_ds.data_vars:
-            lats = u_ds.nav_lat.values
-            lons = u_ds.nav_lon.values
-            print(f"Using SCHISM data variables: nav_lat, nav_lon")
-        elif 'nav_lat' in u_data.coords and 'nav_lon' in u_data.coords:
-            lats = u_data.nav_lat.values
-            lons = u_data.nav_lon.values
-            print(f"Using SCHISM coordinates: nav_lat, nav_lon")
-        elif 'lat' in u_data.coords:
-            lats = u_data.lat.values
-            lons = u_data.lon.values
-        elif 'latitude' in u_data.coords:
-            lats = u_data.latitude.values
-            lons = u_data.longitude.values
-        else:
-            available_coords = list(u_data.coords)
-            available_vars = list(u_ds.data_vars)
-            return jsonify({"error": f"Could not find lat/lon coordinates. Available coords: {available_coords}, Available vars: {available_vars}"}), 500
-            
-        print(f"Coordinate shapes: lats={lats.shape}, lons={lons.shape}")
-            
-        # Create meshgrid if needed
-        if len(lats.shape) == 1 and len(lons.shape) == 1:
-            lon_grid, lat_grid = np.meshgrid(lons, lats)
-        else:
-            lat_grid = lats
-            lon_grid = lons
-            
+        # --- Extract 2D (y, x) slice from cached array ------------------------
+        u_2d = u_arr
+        v_2d = v_arr
+        if time_index is not None:
+            u_2d = u_2d[time_index]
+            v_2d = v_2d[time_index]
+        if depth_index is not None and u_2d.ndim > 2:
+            u_2d = u_2d[depth_index]
+            v_2d = v_2d[depth_index]
+        print(f"u_2d shape after time/depth selection: {u_2d.shape}")
+
+        # --- Bounding box + subsampling ---------------------------------------
         # Filter data to bounding box
         lat_mask = (lat_grid >= lat_min) & (lat_grid <= lat_max)
         lon_mask = (lon_grid >= lon_min) & (lon_grid <= lon_max)
         mask = lat_mask & lon_mask
-        
+
         # Subsample based on grid density with aspect ratio correction
-        if len(lat_grid.shape) == 2:
-            # Calculate aspect ratio of the requested region
+        if lat_grid.ndim == 2:
             lat_range = lat_max - lat_min
             lon_range = lon_max - lon_min
-            aspect_ratio = lon_range / lat_range
-            
-            # Adjust grid density for longitude to account for aspect ratio
-            # This ensures more uniform spacing in both directions
+            aspect_ratio = lon_range / lat_range if lat_range else 1.0
+
             grid_density_lat = grid_density
             grid_density_lon = max(grid_density, int(grid_density * aspect_ratio))
-            
+
             step_lat = max(1, lat_grid.shape[0] // grid_density_lat)
             step_lon = max(1, lat_grid.shape[1] // grid_density_lon)
-            
+
             print(f"Grid density adjustment: lat_range={lat_range:.1f}°, lon_range={lon_range:.1f}°, aspect_ratio={aspect_ratio:.1f}")
-            print(f"Grid densities: lat={grid_density_lat}, lon={grid_density_lon}")
             print(f"Steps: lat={step_lat}, lon={step_lon}")
-            
-            # Apply subsampling
-            lat_sub = lat_grid[::step_lat, ::step_lon]
-            lon_sub = lon_grid[::step_lat, ::step_lon]
+
+            lat_sub  = lat_grid[::step_lat, ::step_lon]
+            lon_sub  = lon_grid[::step_lat, ::step_lon]
             mask_sub = mask[::step_lat, ::step_lon]
-            u_sub = u_data.values[::step_lat, ::step_lon]
-            v_sub = v_data.values[::step_lat, ::step_lon]
+            u_sub    = u_2d[::step_lat, ::step_lon]
+            v_sub    = v_2d[::step_lat, ::step_lon]
         else:
-            # Handle 1D case
+            lats = lat_grid.ravel()
+            lons = lon_grid.ravel()
             lat_indices = np.where((lats >= lat_min) & (lats <= lat_max))[0]
             lon_indices = np.where((lons >= lon_min) & (lons <= lon_max))[0]
-            
+
             step_lat = max(1, len(lat_indices) // grid_density)
             step_lon = max(1, len(lon_indices) // grid_density)
-            
+
             lat_sub_idx = lat_indices[::step_lat]
             lon_sub_idx = lon_indices[::step_lon]
-            
+
             lat_sub = lats[lat_sub_idx]
             lon_sub = lons[lon_sub_idx]
-            
-            # Create subsampled data
-            u_sub = u_data.values[np.ix_(lat_sub_idx, lon_sub_idx)]
-            v_sub = v_data.values[np.ix_(lat_sub_idx, lon_sub_idx)]
-            
+
+            u_sub = u_2d[np.ix_(lat_sub_idx, lon_sub_idx)]
+            v_sub = v_2d[np.ix_(lat_sub_idx, lon_sub_idx)]
+
             lon_grid_sub, lat_grid_sub = np.meshgrid(lon_sub, lat_sub)
-            lat_sub = lat_grid_sub
-            lon_sub = lon_grid_sub
+            lat_sub  = lat_grid_sub
+            lon_sub  = lon_grid_sub
             mask_sub = np.ones_like(lat_sub, dtype=bool)
             
         # Create vector field data (skip land points using precomputed land mask)
@@ -1031,10 +1017,6 @@ def get_vector_field():
                         "magnitude": magnitude
                     })
                     
-        # Close datasets
-        u_ds.close()
-        v_ds.close()
-        
         response_data = {
             "timestamp": timestamp,
             "vectors": vectors,
